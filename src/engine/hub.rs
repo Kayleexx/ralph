@@ -23,7 +23,7 @@ pub async fn resolve_revision(
     }
     let json: serde_json::Value = resp.json().await.ok()?;
     let sha = json.get("sha")?.as_str()?;
-    Some(sha.chars().take(12).collect())
+    Some(sha.to_string())
 }
 
 #[cfg(test)]

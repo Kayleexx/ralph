@@ -10,6 +10,7 @@ pub enum Request {
     Query { session: String, prompt: String },
     Ps,
     Inspect { session: String },
+    Recover { session: String },
 }
 
 /// Sent by the client in place of a new request while a `Query` is streaming, to cancel
@@ -32,6 +33,8 @@ pub struct SessionInfo {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct InspectInfo {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_failure: Option<String>,
     pub session: SessionInfo,
     pub recoverability: String,
     pub fast_restore: String,
@@ -40,6 +43,8 @@ pub struct InspectInfo {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ErrorPayload {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic: Option<String>,
     pub exit_code: i32,
     pub summary: String,
     pub detail: Vec<String>,

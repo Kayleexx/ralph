@@ -10,13 +10,21 @@ use super::{SCHEMA, StorageError};
 
 type Migration = fn(&Connection) -> Result<(), StorageError>;
 
-const MIGRATIONS: &[Migration] = &[migrate_v1_nullable_model_revision];
+const MIGRATIONS: &[Migration] = &[
+    migrate_v1_nullable_model_revision,
+    migrate_v2_token_turns,
+    migrate_v3_restarts,
+    migrate_v4_tokens,
+    migrate_v5_integrity,
+];
 
 pub(crate) fn run(conn: &Connection) -> Result<(), StorageError> {
     let current: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     for (i, migration) in MIGRATIONS.iter().enumerate().skip(current.max(0) as usize) {
-        migration(conn)?;
-        conn.pragma_update(None, "user_version", (i + 1) as i64)?;
+        let tx = conn.unchecked_transaction()?;
+        migration(&tx)?;
+        tx.pragma_update(None, "user_version", (i + 1) as i64)?;
+        tx.commit()?;
     }
     Ok(())
 }
@@ -62,6 +70,30 @@ fn migrate_v1_nullable_model_revision(conn: &Connection) -> Result<(), StorageEr
          FROM sessions_v0;
          DROP TABLE sessions_v0;"
     ))?;
+    Ok(())
+}
+
+/// `token_turns` (Phase 2's durable turn history) didn't exist before this migration —
+/// `CREATE TABLE IF NOT EXISTS` alone is enough here since there's no existing data to
+/// reshape, unlike `migrate_v1_nullable_model_revision`.
+fn migrate_v2_token_turns(conn: &Connection) -> Result<(), StorageError> {
+    conn.execute_batch(super::token_log::SCHEMA)?;
+    Ok(())
+}
+
+fn migrate_v3_restarts(conn: &Connection) -> Result<(), StorageError> {
+    conn.execute_batch("CREATE TABLE worker_restarts (model TEXT PRIMARY KEY, attempts INTEGER NOT NULL, failure TEXT NOT NULL)")?;
+    Ok(())
+}
+
+fn migrate_v4_tokens(conn: &Connection) -> Result<(), StorageError> {
+    conn.execute_batch("ALTER TABLE token_turns ADD COLUMN token_ids TEXT; ALTER TABLE token_turns ADD COLUMN complete INTEGER")?;
+    Ok(())
+}
+
+fn migrate_v5_integrity(conn: &Connection) -> Result<(), StorageError> {
+    conn.execute_batch("ALTER TABLE token_turns ADD COLUMN checksum TEXT")?;
+    super::token_log::seal_existing(conn)?;
     Ok(())
 }
 

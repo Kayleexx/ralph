@@ -27,6 +27,7 @@ pub async fn run_chat(home: &Path, cli: Flags, session: String) -> i32 {
             return print_error(
                 cli,
                 &crate::ipc::ErrorPayload {
+                    diagnostic: None,
                     exit_code: 4,
                     summary: format!("session is {}, cannot chat", info.session.state),
                     detail: vec![],

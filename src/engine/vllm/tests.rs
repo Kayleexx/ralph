@@ -1,4 +1,5 @@
 use super::*;
+use crate::engine::Role;
 
 #[test]
 fn free_ports_are_distinct() {
@@ -53,6 +54,11 @@ fn serve_args_include_revision_when_requested() {
     let args = vllm_serve_args("model", 8000, Some("abc123"));
     let pos = args.iter().position(|a| a == "--revision").unwrap();
     assert_eq!(args[pos + 1], "abc123");
+    let tokenizer = args
+        .iter()
+        .position(|a| a == "--tokenizer-revision")
+        .unwrap();
+    assert_eq!(args[tokenizer + 1], "abc123");
 }
 
 #[tokio::test]
@@ -113,7 +119,11 @@ async fn generate_sends_chat_completions_request_with_messages() {
     let mut engine = VllmEngine::new(PathBuf::from("/dev/null"));
     engine.base_url = format!("http://{addr}");
     engine.model = "test-model".to_string();
-    let mut handle = engine.generate("hello").await.unwrap();
+    let messages = [ChatMessage {
+        role: Role::User,
+        content: "hello".to_string(),
+    }];
+    let mut handle = engine.generate(&messages).await.unwrap();
     while handle.tokens.recv().await.is_some() {}
 
     let request = server.await.unwrap();

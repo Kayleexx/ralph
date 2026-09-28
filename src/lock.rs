@@ -42,10 +42,14 @@ impl SessionLocks {
     }
 
     fn entry(&self, id: &str) -> Arc<AsyncMutex<()>> {
-        let mut map = self.inner.lock().expect("session lock registry poisoned");
+        let mut map = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         map.entry(id.to_string())
             .or_insert_with(|| Arc::new(AsyncMutex::new(())))
             .clone()
+    }
+
+    pub async fn acquire(&self, id: &str) -> OwnedMutexGuard<()> {
+        self.entry(id).lock_owned().await
     }
 
     /// Fails fast rather than queuing, so a second concurrent mutating command gets a

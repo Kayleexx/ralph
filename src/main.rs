@@ -53,6 +53,7 @@ async fn dispatch(cli: Cli) -> i32 {
         Command::Chat { session } => chat::run_chat(&home, flags, session).await,
         Command::Ps => commands::run_ps(&home, flags).await,
         Command::Inspect { session } => commands::run_inspect(&home, flags, session).await,
+        Command::Recover { session } => commands::run_recover(&home, flags, session).await,
         Command::Doctor => commands::run_doctor(&home, flags),
     }
 }

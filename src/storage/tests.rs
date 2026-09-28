@@ -101,12 +101,16 @@ fn reconciliation_demotes_active_session_with_dead_pid() {
         )
         .unwrap();
     let demoted = storage
-        .reconcile_after_restart(|_pid| false, "2026-01-01T00:02:00Z")
+        .reconcile_after_restart(
+            |_pid| false,
+            SessionState::Recovering,
+            "2026-01-01T00:02:00Z",
+        )
         .unwrap();
     assert_eq!(demoted, vec!["01AAA".to_string()]);
     assert_eq!(
         storage.resolve("demo").unwrap().state,
-        SessionState::Stopped
+        SessionState::Recovering
     );
 }
 
@@ -123,7 +127,11 @@ fn reconciliation_leaves_active_session_with_live_pid_alone() {
         )
         .unwrap();
     let demoted = storage
-        .reconcile_after_restart(|_pid| true, "2026-01-01T00:02:00Z")
+        .reconcile_after_restart(
+            |_pid| true,
+            SessionState::Recovering,
+            "2026-01-01T00:02:00Z",
+        )
         .unwrap();
     assert!(demoted.is_empty());
     assert_eq!(storage.resolve("demo").unwrap().state, SessionState::Active);
@@ -142,7 +150,24 @@ fn reconciliation_demotes_stuck_starting_session() {
         )
         .unwrap();
     let demoted = storage
-        .reconcile_after_restart(|_pid| true, "2026-01-01T00:02:00Z")
+        .reconcile_after_restart(
+            |_pid| true,
+            SessionState::Recovering,
+            "2026-01-01T00:02:00Z",
+        )
         .unwrap();
     assert_eq!(demoted, vec!["01AAA".to_string()]);
+}
+
+#[test]
+fn malformed_database_is_a_corruption_error_and_is_preserved() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("broken.db");
+    let bytes = b"this is not a sqlite database";
+    std::fs::write(&path, bytes).unwrap();
+    assert!(matches!(
+        Storage::open(&path),
+        Err(StorageError::Corrupt(_))
+    ));
+    assert_eq!(std::fs::read(path).unwrap(), bytes);
 }

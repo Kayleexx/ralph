@@ -13,10 +13,14 @@ use tokio::sync::{mpsc, oneshot};
 
 #[derive(Debug, Error)]
 pub enum EngineError {
+    #[error("{model}: {cause}")]
+    Startup {
+        model: String,
+        cause: String,
+        diagnostic: String,
+    },
     #[error("no usable GPU is available")]
     NoGpu,
-    #[error("out of GPU memory: {0}")]
-    OutOfMemory(String),
     #[error("worker did not become healthy within the startup timeout: {0}")]
     HealthTimeout(String),
     #[error("worker exited unexpectedly: {0}")]
@@ -45,6 +49,27 @@ pub struct ResolvedModel {
     pub engine_version: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    User,
+    Assistant,
+}
+
+impl Role {
+    fn as_str(self) -> &'static str {
+        match self {
+            Role::User => "user",
+            Role::Assistant => "assistant",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ChatMessage {
+    pub role: Role,
+    pub content: String,
+}
+
 pub enum HealthStatus {
     Healthy,
     Unhealthy(String),
@@ -52,8 +77,19 @@ pub enum HealthStatus {
 
 /// A single in-flight generation. `cancel` lets the caller stop it early (Ctrl-C);
 /// dropping `tokens` without cancelling has the same effect once the sender notices.
+#[derive(Debug)]
+pub struct TokenChunk {
+    pub text: String,
+    pub ids: Vec<u32>,
+}
+
+pub struct Tokenized {
+    pub ids: Vec<u32>,
+    pub limit: u32,
+}
+
 pub struct GenerationHandle {
-    pub tokens: mpsc::Receiver<Result<String, EngineError>>,
+    pub tokens: mpsc::Receiver<Result<TokenChunk, EngineError>>,
     pub cancel: oneshot::Sender<()>,
 }
 
@@ -68,8 +104,17 @@ pub trait Engine: Send {
     fn health(&self) -> impl Future<Output = HealthStatus> + Send;
     fn generate(
         &self,
-        prompt: &str,
+        messages: &[ChatMessage],
     ) -> impl Future<Output = Result<GenerationHandle, EngineError>> + Send;
+    fn prefill(
+        &self,
+        messages: &[ChatMessage],
+    ) -> impl Future<Output = Result<(), EngineError>> + Send;
+    fn tokenize(
+        &self,
+        messages: &[ChatMessage],
+    ) -> impl Future<Output = Result<Tokenized, EngineError>> + Send;
+    fn encode(&self, text: &str) -> impl Future<Output = Result<Vec<u32>, EngineError>> + Send;
     fn stop_model(&mut self) -> impl Future<Output = Result<(), EngineError>> + Send;
     /// Offloads weights to host RAM and frees the GPU allocation without exiting the
     /// process — much cheaper to undo than a cold start. A no-op is never assumed; the

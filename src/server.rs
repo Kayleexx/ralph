@@ -12,6 +12,11 @@ use crate::ipc::{self, Cancel, ErrorPayload, Response, ServerMessage};
 use crate::lock::DaemonLock;
 use crate::storage::Storage;
 
+mod query;
+#[cfg(test)]
+mod tests;
+use query::handle_query;
+
 /// Runs the daemon in the foreground: acquires the single-instance lock, binds the
 /// socket, reconciles state left over from a previous run, then serves forever. If
 /// another daemon already holds the lock, this returns immediately — a working daemon
@@ -34,7 +39,9 @@ pub async fn run_daemon<E: Engine + 'static>(
     let db_path = ralph_home.join("ralph.db");
     let storage = Storage::open(&db_path).map_err(std::io::Error::other)?;
     let daemon = Daemon::new(storage, ralph_home, make_engine);
-    let _ = daemon.reconcile_on_startup();
+    daemon
+        .reconcile_on_startup()
+        .map_err(std::io::Error::other)?;
 
     let listener = UnixListener::bind(&socket_path)?;
     loop {
@@ -55,8 +62,10 @@ async fn handle_connection<E: Engine + 'static>(
     };
     match request {
         ipc::Request::Run { model, name } => {
-            let result = daemon.run(model, name).await.map(Response::Run);
-            send_result(&mut stream, result).await
+            lifecycle(&mut stream, |cancel| {
+                daemon.run_cancellable(model, name, Some(cancel))
+            })
+            .await
         }
         ipc::Request::Ps => send_result(&mut stream, daemon.ps().map(Response::Ps)).await,
         ipc::Request::Inspect { session } => {
@@ -65,11 +74,17 @@ async fn handle_connection<E: Engine + 'static>(
         ipc::Request::Query { session, prompt } => {
             handle_query(&daemon, &mut stream, &session, &prompt).await
         }
+        ipc::Request::Recover { session } => {
+            lifecycle(&mut stream, |cancel| {
+                daemon.recover_cancellable(&session, Some(cancel))
+            })
+            .await
+        }
     }
 }
 
-async fn send_result(
-    stream: &mut UnixStream,
+async fn send_result<W: tokio::io::AsyncWrite + Unpin>(
+    stream: &mut W,
     result: Result<Response, CliError>,
 ) -> std::io::Result<()> {
     let response = result.unwrap_or_else(|e| Response::Error(to_error_payload(&e)));
@@ -79,6 +94,7 @@ async fn send_result(
 fn to_error_payload(e: &CliError) -> ErrorPayload {
     let envelope = error::envelope(e);
     ErrorPayload {
+        diagnostic: e.diagnostic().map(str::to_string),
         exit_code: error::exit_code(e),
         summary: envelope.summary,
         detail: envelope.detail,
@@ -86,51 +102,21 @@ fn to_error_payload(e: &CliError) -> ErrorPayload {
     }
 }
 
-async fn handle_query<E: Engine + 'static>(
-    daemon: &Arc<Daemon<E>>,
+async fn lifecycle<F: std::future::Future<Output = Result<crate::ipc::SessionInfo, CliError>>>(
     stream: &mut UnixStream,
-    session: &str,
-    prompt: &str,
+    operation: impl FnOnce(tokio::sync::oneshot::Receiver<()>) -> F,
 ) -> std::io::Result<()> {
-    let running = match daemon.begin_query(session).await {
-        Ok(r) => r,
-        Err(e) => return send_result(stream, Err(e)).await,
-    };
-
-    let generation = {
-        let engine = running.engine.lock().await;
-        engine.generate(prompt).await
-    };
-    let handle = match generation {
-        Ok(h) => h,
-        Err(e) => return send_result(stream, Err(map_engine_error(e))).await,
-    };
-
-    let mut tokens = handle.tokens;
-    let mut cancel = Some(handle.cancel);
-    let mut token_count: i64 = 0;
-    loop {
-        tokio::select! {
-            chunk = tokens.recv() => {
-                match chunk {
-                    Some(Ok(text)) => {
-                        token_count += 1;
-                        ipc::write_frame(stream, &ServerMessage::Chunk(text)).await?;
-                    }
-                    _ => break,
-                }
-            }
-            cancel_msg = ipc::read_frame::<_, Cancel>(stream) => {
-                if matches!(cancel_msg, Ok(Some(_))) {
-                    if let Some(tx) = cancel.take() {
-                        let _ = tx.send(());
-                    }
-                } else {
-                    break;
-                }
-            }
+    let (mut reader, mut writer) = stream.split();
+    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+    let operation = operation(cancel_rx);
+    tokio::pin!(operation);
+    let result = tokio::select! {
+        result=&mut operation => result,
+        _=ipc::read_frame::<_,Cancel>(&mut reader) => {
+            // The receiver may already have completed; cancellation then has no effect.
+            let _=cancel_tx.send(());
+            operation.await
         }
-    }
-    let _ = daemon.record_tokens(&running.session_id, token_count);
-    ipc::write_frame(stream, &ServerMessage::Done { token_count }).await
+    };
+    send_result(&mut writer, result.map(Response::Run)).await
 }

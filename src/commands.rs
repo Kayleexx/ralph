@@ -1,5 +1,6 @@
 //! CLI command handlers: connects to the daemon (or runs checks directly, for `doctor`),
 //! sends the request, and renders the human/JSON/quiet output for each command.
+mod generation;
 use std::io::{IsTerminal, Read, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -56,6 +57,12 @@ pub(crate) fn print_json<T: serde::Serialize>(value: &T) {
 
 pub(crate) fn print_error(cli: Flags, payload: &ErrorPayload) -> i32 {
     if cli.json {
+        let mut payload = serde_json::json!(payload);
+        if !cli.verbose
+            && let Some(object) = payload.as_object_mut()
+        {
+            object.remove("diagnostic");
+        }
         print_json(&serde_json::json!({ "error": payload }));
     } else {
         let envelope = Envelope {
@@ -65,6 +72,11 @@ pub(crate) fn print_error(cli: Flags, payload: &ErrorPayload) -> i32 {
         };
         eprintln!("{}", envelope.render(cli.no_color));
     }
+    if cli.verbose
+        && let Some(diagnostic) = &payload.diagnostic
+    {
+        eprintln!("{diagnostic}");
+    }
     payload.exit_code
 }
 
@@ -72,6 +84,7 @@ pub(crate) fn print_io_error(cli: Flags, e: std::io::Error) -> i32 {
     print_error(
         cli,
         &ErrorPayload {
+            diagnostic: None,
             exit_code: 1,
             summary: "could not reach the ralph daemon".to_string(),
             detail: vec![e.to_string()],
@@ -116,6 +129,7 @@ async fn resolve_model_and_name(
             return Err(print_error(
                 cli,
                 &ErrorPayload {
+                    diagnostic: None,
                     exit_code: 2,
                     summary: "no model specified".to_string(),
                     detail: vec![],
@@ -127,6 +141,7 @@ async fn resolve_model_and_name(
             return Err(print_error(
                 cli,
                 &ErrorPayload {
+                    diagnostic: None,
                     exit_code: 1,
                     summary: "cancelled".to_string(),
                     detail: vec![],
@@ -153,6 +168,7 @@ async fn resolve_model_and_name(
 async fn send_with_progress(
     stream: &mut UnixStream,
     request: &Request,
+    phase: &str,
 ) -> std::io::Result<Response> {
     let request_fut = client::send_request(stream, request);
     tokio::pin!(request_fut);
@@ -166,8 +182,7 @@ async fn send_with_progress(
             result = &mut request_fut => break result,
             _ = ticks.tick() => {
                 let elapsed = start.elapsed().as_secs();
-                let hint = if elapsed >= 20 { " (loading model weights, this can take a few minutes)" } else { "" };
-                eprint!("\rstarting... {elapsed}s{hint}");
+                eprint!("\r{phase}... {elapsed}s");
                 let _ = std::io::stderr().flush();
                 printed = true;
             }
@@ -191,7 +206,7 @@ pub async fn run_run(home: &Path, cli: Flags, model: Option<String>, name: Optio
     let request = Request::Run { model, name };
     let show_progress = !cli.json && !cli.quiet && std::io::stdout().is_terminal();
     let result = if show_progress {
-        send_with_progress(&mut stream, &request).await
+        send_with_progress(&mut stream, &request, "starting").await
     } else {
         client::send_request(&mut stream, &request).await
     };
@@ -220,41 +235,7 @@ pub async fn run_run(home: &Path, cli: Flags, model: Option<String>, name: Optio
     }
 }
 
-pub async fn run_query(
-    home: &Path,
-    cli: Flags,
-    session: String,
-    prompt_arg: Option<String>,
-) -> i32 {
-    let prompt = match prompt_arg.as_deref() {
-        None | Some("-") => {
-            let mut buf = String::new();
-            if let Err(e) = std::io::stdin().read_to_string(&mut buf) {
-                return print_io_error(cli, e);
-            }
-            buf
-        }
-        Some(p) => p.to_string(),
-    };
-    let stream = match connect(home, cli).await {
-        Ok(s) => s,
-        Err(code) => return code,
-    };
-    match client::run_query(stream, &session, &prompt, cli.json).await {
-        Ok(client::QueryResult::Outcome(outcome)) => {
-            if cli.json {
-                print_json(
-                    &serde_json::json!({ "session": session, "text": outcome.text, "tokens": outcome.token_count }),
-                );
-            } else {
-                println!();
-            }
-            i32::from(outcome.cancelled)
-        }
-        Ok(client::QueryResult::Failed(payload)) => print_error(cli, &payload),
-        Err(e) => print_io_error(cli, e),
-    }
-}
+pub use generation::{run_query, run_recover};
 
 pub async fn run_ps(home: &Path, cli: Flags) -> i32 {
     let mut stream = match connect(home, cli).await {
@@ -328,6 +309,9 @@ pub async fn run_inspect(home: &Path, cli: Flags, session: String) -> i32 {
                 println!("  recoverability: {}", info.recoverability);
                 println!("  fast restore: {}", info.fast_restore);
                 println!("  portable state: {}", info.portable_state);
+                if let Some(failure) = info.last_failure {
+                    println!("  last worker failure: {failure}");
+                }
             }
             0
         }

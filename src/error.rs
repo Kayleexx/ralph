@@ -9,6 +9,16 @@ use crate::storage::StorageError;
 
 #[derive(Debug, Error)]
 pub enum CliError {
+    #[error("{summary}")]
+    Startup { summary: String, diagnostic: String },
+    #[error("{source}")]
+    SessionOperation {
+        source: Box<CliError>,
+        session: String,
+        model: String,
+    },
+    #[error("could not persist session state")]
+    Persistence { diagnostic: String },
     #[error("{0}")]
     Usage(String),
     #[error("session {0:?} already exists")]
@@ -30,6 +40,23 @@ pub enum CliError {
     Other(#[from] anyhow::Error),
 }
 
+impl CliError {
+    pub fn diagnostic(&self) -> Option<&str> {
+        match self {
+            Self::Startup { diagnostic, .. } | Self::Persistence { diagnostic } => Some(diagnostic),
+            Self::SessionOperation { source, .. } => source.diagnostic(),
+            _ => None,
+        }
+    }
+    pub fn for_session(self, session: &str, model: &str) -> Self {
+        Self::SessionOperation {
+            source: Box::new(self),
+            session: session.into(),
+            model: model.into(),
+        }
+    }
+}
+
 impl From<StorageError> for CliError {
     fn from(e: StorageError) -> Self {
         match e {
@@ -44,7 +71,9 @@ impl From<StorageError> for CliError {
             StorageError::AmbiguousPrefix(id, matches) => CliError::AmbiguousPrefix(id, matches),
             StorageError::Busy => CliError::Resource("storage is busy, try again".to_string()),
             StorageError::Corrupt(detail) => CliError::Corrupt(detail),
-            StorageError::Sqlite(e) => CliError::Other(anyhow::anyhow!(e)),
+            StorageError::Sqlite(e) => CliError::Persistence {
+                diagnostic: e.to_string(),
+            },
         }
     }
 }
@@ -57,12 +86,13 @@ impl From<StateError> for CliError {
 
 pub fn exit_code(err: &CliError) -> i32 {
     match err {
+        CliError::SessionOperation { source, .. } => exit_code(source),
         CliError::Usage(_) | CliError::DuplicateName(_) => 2,
         CliError::NotFound { .. } | CliError::AmbiguousPrefix(_, _) => 3,
         CliError::InvalidState(_) => 4,
-        CliError::Resource(_) => 6,
+        CliError::Resource(_) | CliError::Startup { .. } => 6,
         CliError::Corrupt(_) => 8,
-        CliError::Other(_) => 1,
+        CliError::Other(_) | CliError::Persistence { .. } => 1,
     }
 }
 
@@ -90,6 +120,31 @@ impl Envelope {
 
 pub fn envelope(err: &CliError) -> Envelope {
     match err {
+        CliError::SessionOperation {
+            source,
+            session,
+            model,
+        } => {
+            let mut envelope = envelope(source);
+            if !envelope.summary.starts_with(model) {
+                envelope.summary = format!("{model}: {}", envelope.summary);
+            }
+            envelope
+                .detail
+                .retain(|detail| detail != "session is stopped; durable state preserved");
+            envelope.detail.push(format!(
+                "session {session:?} is stopped; durable state preserved"
+            ));
+            envelope.next = Some(format!(
+                "resolve the cause, then run: ralph recover {session}"
+            ));
+            envelope
+        }
+        CliError::Persistence { .. } => Envelope {
+            summary: "could not persist session state".into(),
+            detail: vec!["last committed state is preserved".into()],
+            next: Some("check free disk space and data-directory permissions, then retry".into()),
+        },
         CliError::Usage(msg) => Envelope {
             summary: msg.clone(),
             detail: vec![],
@@ -120,6 +175,11 @@ pub fn envelope(err: &CliError) -> Envelope {
             summary: "session cannot do this right now".to_string(),
             detail: vec![reason.clone()],
             next: None,
+        },
+        CliError::Startup { summary, .. } => Envelope {
+            summary: summary.clone(),
+            detail: vec!["session is stopped; durable state preserved".into()],
+            next: Some("free GPU resources, then run: ralph recover <session>".into()),
         },
         CliError::Resource(reason) => Envelope {
             summary: reason.clone(),

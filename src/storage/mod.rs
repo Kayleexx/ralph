@@ -3,6 +3,7 @@
 //! Every state-changing write goes through one `rusqlite` transaction, relying on
 //! SQLite's own WAL guarantees for crash-safety instead of a hand-rolled
 //! temp-file+fsync+rename scheme.
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension, params};
@@ -12,8 +13,10 @@ use crate::state::SessionState;
 use crate::typo::suggest_similar;
 
 mod migrate;
+mod restarts;
 #[cfg(test)]
 mod tests;
+mod token_log;
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -36,10 +39,22 @@ pub enum StorageError {
 
 impl From<rusqlite::Error> for StorageError {
     fn from(e: rusqlite::Error) -> Self {
-        if let rusqlite::Error::SqliteFailure(inner, _) = &e
-            && inner.code == rusqlite::ErrorCode::DatabaseBusy
-        {
-            return StorageError::Busy;
+        if matches!(
+            e,
+            rusqlite::Error::FromSqlConversionFailure(..) | rusqlite::Error::InvalidColumnType(..)
+        ) {
+            return StorageError::Corrupt(e.to_string());
+        }
+        if let rusqlite::Error::SqliteFailure(inner, _) = &e {
+            match inner.code {
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked => {
+                    return StorageError::Busy;
+                }
+                rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase => {
+                    return StorageError::Corrupt(e.to_string());
+                }
+                _ => {}
+            }
         }
         StorageError::Sqlite(e)
     }
@@ -86,6 +101,15 @@ const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS sessions (
 
 impl Storage {
     pub fn open(path: &Path) -> Result<Self, StorageError> {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(path)
+            .map_err(|e| StorageError::Corrupt(format!("cannot open durable state: {e}")))?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| StorageError::Corrupt(format!("cannot protect durable state: {e}")))?;
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "busy_timeout", 5000)?;
@@ -107,6 +131,11 @@ impl Storage {
         migrate::run(&conn)?;
         conn.execute(SCHEMA, [])?;
         Ok(Self { conn })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_execute(&self, sql: &str) {
+        self.conn.execute_batch(sql).unwrap();
     }
 
     pub fn name_taken(&self, name: &str) -> Result<bool, StorageError> {
@@ -191,23 +220,8 @@ impl Storage {
     ) -> Result<(), StorageError> {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
-            "UPDATE sessions SET model_revision = ?1, engine_version = ?2, updated_at = ?3 WHERE id = ?4",
+            "UPDATE sessions SET model_revision = ?1, tokenizer_revision = ?1, engine_version = ?2, updated_at = ?3 WHERE id = ?4",
             params![model_revision, engine_version, updated_at, id],
-        )?;
-        tx.commit()?;
-        Ok(())
-    }
-
-    pub fn set_token_count(
-        &self,
-        id: &str,
-        token_count: i64,
-        updated_at: &str,
-    ) -> Result<(), StorageError> {
-        let tx = self.conn.unchecked_transaction()?;
-        tx.execute(
-            "UPDATE sessions SET token_count = ?1, updated_at = ?2 WHERE id = ?3",
-            params![token_count, updated_at, id],
         )?;
         tx.commit()?;
         Ok(())
@@ -241,7 +255,10 @@ impl Storage {
                     suggestion,
                 })
             }
-            1 => Ok(matches.into_iter().next().unwrap()),
+            1 => matches
+                .into_iter()
+                .next()
+                .ok_or_else(|| StorageError::Corrupt("session resolution lost its match".into())),
             _ => Err(StorageError::AmbiguousPrefix(
                 identifier.to_string(),
                 matches.into_iter().map(|r| r.name).collect(),
@@ -282,17 +299,18 @@ impl Storage {
     }
 
     /// Any session left in `Starting`, or `Active` with no currently-live worker, is
-    /// demoted to `Stopped` rather than left pretending to be usable. Called on daemon
-    /// startup to reconcile state after a crash or reboot.
+    /// demoted to `to` (never left pretending to be usable) — called on daemon startup to
+    /// reconcile state after a crash or reboot.
     pub fn reconcile_after_restart(
         &self,
         is_pid_alive: impl Fn(i64) -> bool,
+        to: SessionState,
         now: &str,
     ) -> Result<Vec<String>, StorageError> {
         let mut demoted = Vec::new();
         for row in self.list()? {
             let stale = match row.state {
-                SessionState::Starting => true,
+                SessionState::Starting | SessionState::Recovering => true,
                 SessionState::Active => match row.pid {
                     Some(pid) => !is_pid_alive(pid),
                     None => true,
@@ -300,7 +318,7 @@ impl Storage {
                 _ => false,
             };
             if stale {
-                self.set_state(&row.id, SessionState::Stopped, None, now)?;
+                self.set_state(&row.id, to, None, now)?;
                 demoted.push(row.id);
             }
         }

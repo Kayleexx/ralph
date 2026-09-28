@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 use crate::doctor;
-use crate::engine::{Engine, EngineError, ModelSpec, ResolvedModel};
+use crate::engine::{ChatMessage, Engine, EngineError, ResolvedModel};
 use crate::error::CliError;
 use crate::ipc::{InspectInfo, SessionInfo};
 use crate::lock::SessionLocks;
@@ -17,8 +17,13 @@ use crate::session;
 use crate::state::{self, SessionState};
 use crate::storage::{SessionRow, Storage, StorageError};
 
+mod query;
+mod recovery;
+mod restart;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
+#[cfg(test)]
+mod tests_recovery;
 
 const SUPERVISOR_POLL_INTERVAL: Duration = Duration::from_millis(500);
 // How long a worker can go with no query against any of its sessions before it's put to
@@ -26,10 +31,8 @@ const SUPERVISOR_POLL_INTERVAL: Duration = Duration::from_millis(500);
 // is keyed on activity, not on the attached-session count reaching zero.
 const IDLE_SLEEP_AFTER: Duration = Duration::from_secs(300);
 
-/// One live vLLM process, potentially serving several Ralph sessions that all requested
-/// the same model. Keyed by model id in `Daemon::workers` — Phase 1 has no way to
-/// request a specific revision, so the model id alone is currently a unique enough key;
-/// pinning a revision later would need to become part of the key too.
+/// One worker per model id. Attachment checks the resolved model/tokenizer revision
+/// before sharing it with a historical session.
 struct WorkerEntry<E: Engine> {
     engine: Arc<AsyncMutex<E>>,
     resolved: ResolvedModel,
@@ -46,6 +49,8 @@ fn now_rfc3339() -> String {
 pub struct RunningQuery<E: Engine> {
     pub session_id: String,
     pub engine: Arc<AsyncMutex<E>>,
+    pub messages: Vec<ChatMessage>,
+    pub input_ids: Vec<u32>,
     _guard: OwnedMutexGuard<()>,
 }
 
@@ -57,6 +62,7 @@ pub struct Daemon<E: Engine + 'static> {
     locks: SessionLocks,
     // Keyed by model id, not session id — see `WorkerEntry`.
     workers: AsyncMutex<HashMap<String, WorkerEntry<E>>>,
+    startup: AsyncMutex<()>,
     make_engine: fn(PathBuf) -> E,
     has_gpu: fn() -> bool,
 }
@@ -84,6 +90,7 @@ impl<E: Engine + 'static> Daemon<E> {
             sessions_root,
             locks: SessionLocks::new(),
             workers: AsyncMutex::new(HashMap::new()),
+            startup: AsyncMutex::new(()),
             make_engine,
             has_gpu,
         })
@@ -110,17 +117,38 @@ impl<E: Engine + 'static> Daemon<E> {
     }
 
     /// This daemon process starts with no in-memory worker handles, so any session left
-    /// `Starting`/`Active` from a previous run cannot be reattached — Phase 1 has no
-    /// recovery path back to a worker it didn't spawn itself.
+    /// `Starting`/`Active` from a previous run is marked `Recovering` — never silently
+    /// `Active` again — and left for an explicit `ralph recover` rather than an eager
+    /// auto-restart of every previously-active session on daemon startup.
     pub fn reconcile_on_startup(&self) -> Result<Vec<String>, StorageError> {
-        self.storage()
-            .reconcile_after_restart(|_pid| false, &now_rfc3339())
+        crate::engine::vllm::ownership::reconcile(&self.sessions_root, |id, model, revision| {
+            self.storage().resolve(id).is_ok_and(|row| {
+                row.model == model
+                    && (row.model_revision.is_none() || row.model_revision.as_deref() == revision)
+            })
+        })
+        .map_err(|e| StorageError::Corrupt(format!("worker ownership: {e}")))?;
+        self.storage().reconcile_after_restart(
+            |_pid| false,
+            SessionState::Recovering,
+            &now_rfc3339(),
+        )
     }
 
+    #[cfg(test)]
     pub async fn run(
         self: &Arc<Self>,
         model: String,
         name: Option<String>,
+    ) -> Result<SessionInfo, CliError> {
+        self.run_cancellable(model, name, None).await
+    }
+
+    pub async fn run_cancellable(
+        self: &Arc<Self>,
+        model: String,
+        name: Option<String>,
+        mut cancel: Option<tokio::sync::oneshot::Receiver<()>>,
     ) -> Result<SessionInfo, CliError> {
         if !(self.has_gpu)() {
             return Err(map_engine_error(EngineError::NoGpu));
@@ -150,86 +178,35 @@ impl<E: Engine + 'static> Daemon<E> {
             updated_at: now,
         };
         self.storage().insert(&row)?;
-        let dir = session::create_session_dir(&self.sessions_root, &row)
+        session::create_session_dir(&self.sessions_root, &row)
             .map_err(|e| CliError::Other(e.into()))?;
         self.transition(&id, SessionState::Created, SessionState::Starting, None)?;
 
-        // Reuse a worker already serving this model (waking it first if it's asleep)
-        // instead of cold-starting a second vLLM process for the same weights.
-        let workers = self.workers.lock().await;
-        let reuse = workers
-            .get(&model)
-            .map(|entry| (entry.engine.clone(), entry.resolved.clone()));
-        drop(workers); // never held across the wake-up network round-trip below
-
-        if let Some((engine_handle, resolved)) = reuse {
-            if let Err(e) = wake_if_sleeping(&engine_handle).await {
-                self.transition(&id, SessionState::Starting, SessionState::Failed, None)?;
-                return Err(map_engine_error(e));
-            }
-            // Only attach this session to the worker once it's confirmed usable; the
-            // worker could have crashed and been evicted between the lookup above and
-            // now, in which case there's nothing to attach to.
-            let mut workers = self.workers.lock().await;
-            let Some(entry) = workers.get_mut(&model) else {
-                drop(workers);
-                self.transition(&id, SessionState::Starting, SessionState::Failed, None)?;
-                return Err(CliError::Resource(
-                    "worker exited while starting this session".to_string(),
-                ));
-            };
-            entry.session_ids.push(id.clone());
-            entry.last_active = Instant::now();
-            let pid = entry.engine.lock().await.pid().map(i64::from);
-            drop(workers);
-            self.transition(&id, SessionState::Starting, SessionState::Active, pid)?;
-            self.storage().set_resolved(
-                &id,
-                resolved.revision.as_deref(),
-                resolved.engine_version.as_deref(),
-                &now_rfc3339(),
-            )?;
-            return Ok(to_session_info(&self.storage().resolve(&id)?));
-        }
-
-        let mut engine = (self.make_engine)(session::vllm_log_path(&dir));
-        let spec = ModelSpec {
-            model: model.clone(),
-            revision: None,
-        };
-        match engine.start_model(&spec).await {
-            Ok(resolved) => {
-                let pid = engine.pid().map(i64::from);
-                self.transition(&id, SessionState::Starting, SessionState::Active, pid)?;
+        match self.attach_or_start_worker(&model, &id, &mut cancel).await {
+            Ok((_, resolved, pid)) => {
                 self.storage().set_resolved(
                     &id,
                     resolved.revision.as_deref(),
                     resolved.engine_version.as_deref(),
                     &now_rfc3339(),
                 )?;
-                let handle = Arc::new(AsyncMutex::new(engine));
-                self.workers.lock().await.insert(
-                    model.clone(),
-                    WorkerEntry {
-                        engine: handle.clone(),
-                        resolved,
-                        session_ids: vec![id.clone()],
-                        last_active: Instant::now(),
-                    },
-                );
-                self.spawn_worker_supervisor(model, handle);
+                self.transition(&id, SessionState::Starting, SessionState::Active, pid)?;
                 Ok(to_session_info(&self.storage().resolve(&id)?))
             }
             Err(e) => {
-                self.transition(&id, SessionState::Starting, SessionState::Failed, None)?;
-                Err(map_engine_error(e))
+                self.transition(&id, SessionState::Starting, SessionState::Stopped, None)?;
+                let attempts = self.storage().restart_attempts(&model)?;
+                self.storage()
+                    .record_restart(&model, attempts, &e.to_string())?;
+                Err(e.for_session(&row.name, &row.model))
             }
         }
     }
 
-    /// Watches a worker for unexpected exit — demoting every session attached to it to
-    /// `Stopped` (never `Failed`: a worker crash is not a session failure) — and puts it
-    /// to sleep after `IDLE_SLEEP_AFTER` with no query against any of its sessions.
+    /// Watches a worker for unexpected exit — handing off to `recovery::handle_worker_loss`
+    /// for every attached session (never `Failed` directly: a worker crash is not a
+    /// session failure) — and puts it to sleep after `IDLE_SLEEP_AFTER` with no query
+    /// against any of its sessions.
     fn spawn_worker_supervisor(self: &Arc<Self>, model: String, handle: Arc<AsyncMutex<E>>) {
         let daemon = self.clone();
         tokio::spawn(async move {
@@ -249,23 +226,41 @@ impl<E: Engine + 'static> Daemon<E> {
                     .unwrap_or(false);
                 if idle {
                     let mut engine = handle.lock().await;
-                    if !engine.is_sleeping().await {
-                        let _ = engine.sleep().await;
+                    if !engine.is_sleeping().await
+                        && let Err(error) = engine.sleep().await
+                    {
+                        eprintln!("idle worker sleep failed: {error}");
                     }
                 }
                 tokio::time::sleep(SUPERVISOR_POLL_INTERVAL).await;
             }
-            let session_ids = daemon
-                .workers
-                .lock()
-                .await
-                .remove(&model)
-                .map(|e| e.session_ids)
-                .unwrap_or_default();
-            for id in session_ids {
-                let _ = daemon.transition(&id, SessionState::Active, SessionState::Stopped, None);
+            let startup = daemon.startup.lock().await;
+            if let Err(error) = handle.lock().await.stop_model().await {
+                eprintln!("worker cleanup failed: {error}");
+                return;
             }
+            let session_ids = {
+                let mut workers = daemon.workers.lock().await;
+                if workers
+                    .get(&model)
+                    .is_some_and(|entry| Arc::ptr_eq(&entry.engine, &handle))
+                {
+                    workers
+                        .remove(&model)
+                        .map(|entry| entry.session_ids)
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                }
+            };
+            drop(startup);
+            recovery::handle_worker_loss(&daemon, model, session_ids).await;
         });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_storage_fault(&self, sql: &str) {
+        self.storage().test_execute(sql);
     }
 
     pub fn ps(&self) -> Result<Vec<SessionInfo>, CliError> {
@@ -274,54 +269,22 @@ impl<E: Engine + 'static> Daemon<E> {
 
     pub fn inspect(&self, identifier: &str) -> Result<InspectInfo, CliError> {
         let row = self.storage().resolve(identifier)?;
+        let history = self.storage().replay_turns(&row.id);
+        let complete = history
+            .as_ref()
+            .is_ok_and(|messages| row.token_count == 0 || !messages.is_empty());
         let recoverability = match row.state {
             SessionState::Active | SessionState::Created | SessionState::Starting => "safe",
             SessionState::Failed => "broken",
-            // metadata intact, worker gone, no recovery mechanism yet.
             _ => "degraded",
         };
         Ok(InspectInfo {
             session: to_session_info(&row),
-            recoverability: recoverability.to_string(),
+            recoverability: if complete { recoverability } else { "degraded" }.to_string(),
             fast_restore: "unavailable".to_string(),
-            portable_state: "complete".to_string(),
+            last_failure: self.storage().last_worker_failure(&row.model)?,
+            portable_state: if complete { "complete" } else { "incomplete" }.to_string(),
         })
-    }
-
-    /// Resolves a session for querying and reserves it for exclusive use for the
-    /// duration of the request; a second concurrent query on the *same session* fails
-    /// fast rather than queuing (sessions sharing a worker can still run concurrently —
-    /// this lock is per-session, not per-worker).
-    pub async fn begin_query(&self, identifier: &str) -> Result<RunningQuery<E>, CliError> {
-        let row = self.storage().resolve(identifier)?;
-        if row.state != SessionState::Active {
-            return Err(CliError::InvalidState(format!(
-                "session is {}, cannot query it",
-                row.state
-            )));
-        }
-        let guard = self.locks.try_acquire(&row.id).ok_or_else(|| {
-            CliError::InvalidState("operation already in progress for this session".to_string())
-        })?;
-        let mut workers = self.workers.lock().await;
-        let entry = workers.get_mut(&row.model).ok_or_else(|| {
-            CliError::InvalidState("worker is not running in this daemon".to_string())
-        })?;
-        entry.last_active = Instant::now();
-        let engine = entry.engine.clone();
-        drop(workers);
-        wake_if_sleeping(&engine).await.map_err(map_engine_error)?;
-        Ok(RunningQuery {
-            session_id: row.id,
-            engine,
-            _guard: guard,
-        })
-    }
-
-    pub fn record_tokens(&self, session_id: &str, token_count: i64) -> Result<(), CliError> {
-        Ok(self
-            .storage()
-            .set_token_count(session_id, token_count, &now_rfc3339())?)
     }
 }
 
@@ -352,10 +315,15 @@ fn to_session_info(row: &SessionRow) -> SessionInfo {
 
 pub(crate) fn map_engine_error(e: EngineError) -> CliError {
     match e {
+        EngineError::Startup {
+            model,
+            cause,
+            diagnostic,
+        } => CliError::Startup {
+            summary: format!("{model}: {cause}"),
+            diagnostic,
+        },
         EngineError::NoGpu => CliError::Resource("no usable gpu is available".to_string()),
-        EngineError::OutOfMemory(detail) => {
-            CliError::Resource(format!("out of gpu memory: {detail}"))
-        }
         EngineError::HealthTimeout(reason) => {
             CliError::Resource(format!("worker did not become healthy in time: {reason}"))
         }

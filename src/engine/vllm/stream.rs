@@ -3,15 +3,18 @@ use futures_util::StreamExt;
 use tokio::sync::{mpsc, oneshot};
 
 use super::EngineError;
+use crate::engine::TokenChunk;
 
 pub(super) async fn stream_completion(
     client: reqwest::Client,
     url: String,
     body: serde_json::Value,
-    tx: mpsc::Sender<Result<String, EngineError>>,
+    tx: mpsc::Sender<Result<TokenChunk, EngineError>>,
     mut cancel_rx: oneshot::Receiver<()>,
 ) {
-    let resp = match client.post(&url).json(&body).send().await {
+    let request = client.post(&url).json(&body).send();
+    let response = tokio::select! { _ = &mut cancel_rx => return, _ = tx.closed() => return, response = request => response };
+    let resp = match response {
         Ok(r) => r,
         Err(e) => {
             let _ = tx.send(Err(EngineError::Request(e))).await;
@@ -27,6 +30,7 @@ pub(super) async fn stream_completion(
         return;
     }
     let mut stream = resp.bytes_stream();
+    let mut bytes_buf = Vec::new();
     let mut buf = String::new();
     loop {
         tokio::select! {
@@ -34,7 +38,14 @@ pub(super) async fn stream_completion(
             chunk = stream.next() => {
                 match chunk {
                     Some(Ok(bytes)) => {
-                        buf.push_str(&String::from_utf8_lossy(&bytes));
+                        bytes_buf.extend_from_slice(&bytes);
+                        let valid = match std::str::from_utf8(&bytes_buf) {
+                            Ok(text) => text.len(),
+                            Err(error) if error.error_len().is_none() => error.valid_up_to(),
+                            Err(_) => { let _ = tx.send(Err(EngineError::BadResponse("invalid UTF-8 stream".into()))).await; return; }
+                        };
+                        if let Ok(text) = std::str::from_utf8(&bytes_buf[..valid]) { buf.push_str(text); }
+                        bytes_buf.drain(..valid);
                         if !forward_complete_events(&mut buf, &tx).await {
                             return;
                         }
@@ -43,7 +54,7 @@ pub(super) async fn stream_completion(
                         let _ = tx.send(Err(EngineError::Request(e))).await;
                         return;
                     }
-                    None => return,
+                    None => { let _ = tx.send(Err(EngineError::BadResponse("stream ended before completion marker".into()))).await; return; },
                 }
             }
         }
@@ -80,7 +91,7 @@ fn first_number(text: &str) -> Option<u32> {
 /// carries only a finish reason with no `content` key at all — both are silently skipped.
 async fn forward_complete_events(
     buf: &mut String,
-    tx: &mpsc::Sender<Result<String, EngineError>>,
+    tx: &mpsc::Sender<Result<TokenChunk, EngineError>>,
 ) -> bool {
     while let Some(pos) = buf.find("\n\n") {
         let event = buf[..pos].to_string();
@@ -92,16 +103,60 @@ async fn forward_complete_events(
             if data == "[DONE]" {
                 return false;
             }
-            let Ok(json) = serde_json::from_str::<serde_json::Value>(data) else {
-                continue;
+            let json = match serde_json::from_str::<serde_json::Value>(data) {
+                Ok(json) => json,
+                Err(_) => {
+                    let _ = tx
+                        .send(Err(EngineError::BadResponse(
+                            "malformed stream event".into(),
+                        )))
+                        .await;
+                    return false;
+                }
             };
-            let Some(text) = json["choices"][0]["delta"]["content"].as_str() else {
-                continue;
+            if json.get("error").is_some() {
+                let _ = tx
+                    .send(Err(EngineError::BadResponse(
+                        "engine reported a stream error".into(),
+                    )))
+                    .await;
+                return false;
+            }
+            let choice = &json["choices"][0];
+            let text = choice["delta"]["content"].as_str().unwrap_or("");
+            let ids: Vec<u32> = match choice.get("token_ids").filter(|v| !v.is_null()) {
+                Some(ids) => match serde_json::from_value(ids.clone()) {
+                    Ok(ids) => ids,
+                    Err(_) => {
+                        let _ = tx
+                            .send(Err(EngineError::BadResponse(
+                                "invalid streamed token IDs".into(),
+                            )))
+                            .await;
+                        return false;
+                    }
+                },
+                None if text.is_empty() => continue,
+                None => {
+                    let _ = tx
+                        .send(Err(EngineError::BadResponse(
+                            "stream omitted requested token IDs".into(),
+                        )))
+                        .await;
+                    return false;
+                }
             };
-            if text.is_empty() {
+            if text.is_empty() && ids.is_empty() {
                 continue;
             }
-            if tx.send(Ok(text.to_string())).await.is_err() {
+            if tx
+                .send(Ok(TokenChunk {
+                    text: text.into(),
+                    ids,
+                }))
+                .await
+                .is_err()
+            {
                 return false;
             }
         }
@@ -116,9 +171,11 @@ mod tests {
     #[tokio::test]
     async fn forwards_a_single_chat_delta() {
         let (tx, mut rx) = mpsc::channel(4);
-        let mut buf = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n".to_string();
+        let mut buf =
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"token_ids\":[1]}]}\n\n"
+                .to_string();
         assert!(forward_complete_events(&mut buf, &tx).await);
-        assert_eq!(rx.recv().await.unwrap().unwrap(), "hi");
+        assert_eq!(rx.recv().await.unwrap().unwrap().text, "hi");
     }
 
     #[tokio::test]

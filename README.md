@@ -1,26 +1,20 @@
 # ralph
 
-A continuity runtime for stateful LLM inference. Ralph makes an inference session
-outlive the process, GPU, or machine currently running it.
-
-Your model process can die. Your inference session does not have to.
+A local continuity runtime for stateful LLM inference. Ralph preserves session identity
+and committed conversation history across vLLM worker crashes and daemon restarts.
 
 ## What's here
 
 - A Rust CLI (`ralph`) that talks to a local daemon over a Unix socket
-- The daemon owns session lifecycle, SQLite-backed session metadata (with automatic
-  schema migrations), and a vLLM process adapter (spawn, health-check, streaming
-  generation via chat completions)
-- Sessions for the same model share one vLLM worker instead of each cold-starting their
-  own — a second `ralph run` for a model already in use attaches to the existing worker
-  in well under a second instead of the usual ~30s+ cold start. A worker with no query
-  against any of its sessions for 5 minutes is put to sleep (vLLM's own sleep mode:
-  weights offloaded to host RAM, GPU freed) and woken automatically, in well under a
-  second, on the next query
+- SQLite WAL stores session metadata, accepted inputs, generated token IDs, and history
+- Compatible sessions share one vLLM worker; it sleeps after five idle minutes and
+  wakes for the next query
 - `ralph run [model] [--name name]` — start a model and create a session. With no
   model and a real terminal, shows a small interactive picker instead of failing
 - `ralph query <session> <prompt>` — one-shot/scriptable query, streamed, with safe
   Ctrl-C cancellation
+- `ralph recover <session>` — validate durable history, start or reuse a compatible
+  worker, and reconstruct context through real prefill before returning to active
 - `ralph chat <session>` — interactive back-and-forth with a session
 - `ralph ps` / `ralph inspect <session>` — list and inspect sessions (typo-tolerant:
   `ralph inspect dem` suggests `demo`)
@@ -40,12 +34,8 @@ cargo install --path .
 ```
 
 This installs to `~/.cargo/bin/ralph` — make sure that directory is on your `PATH`.
-**After reinstalling, kill any running daemon** so the new build actually takes effect
-(replacing the binary on disk doesn't restart an already-running daemon process):
-
-```bash
-pkill -f "ralph __daemon"
-```
+A running daemon keeps its current build. Stop the specific daemon for the intended
+data root before using a newly installed binary.
 
 ## Running against real vLLM
 
@@ -63,38 +53,53 @@ whatever `vllm` resolves to on `PATH`.
 Then:
 
 ```bash
-ralph doctor                                          # all six checks should PASS
-ralph run Qwen/Qwen2.5-0.5B-Instruct --name demo       # or just `ralph run` for the picker
-ralph query demo "hello"                               # one-shot
-ralph chat demo                                        # interactive; /exit or Ctrl-D to leave
+ralph doctor
+ralph run Qwen/Qwen2.5-0.5B-Instruct --name demo
+ralph query demo "Remember the word pineapple."
+ralph chat demo
 ralph ps
 ralph --json inspect demo
+ralph recover demo                                    # after worker loss
 ```
 
 Ctrl-C during `query`/`chat` cancels that one generation without touching the session —
 `ralph inspect demo` will still show `state: active` right after.
 
-There's no `ralph stop` yet (that's a later phase), so to free GPU memory when you're
-done, kill the worker directly:
+Worker loss moves a session to `recovering`. Automatic replacement has a durable
+three-attempt budget; repeated failures end in `stopped`. `ralph recover demo` retries
+explicitly and preserves the session ID and history. Repeating recovery on an active
+session is a safe no-op.
 
-```bash
-pkill -9 -f "vllm serve"
-```
+Only one model may be starting or resident in a daemon, including sleeping workers.
+Compatible sessions share that worker; another model receives a resource conflict.
+Startup errors leave the session stopped with its history intact. `-v` exposes the
+bounded startup-log tail and its path.
+
+Durable history and token counts are committed together in SQLite WAL transactions.
+Legacy sessions with missing token data report degraded recoverability and incomplete
+portable state; recovery preserves that evidence and refuses to invent history.
+
+Phase 2 reconstructs logical context; native KV checkpoints and cross-machine recovery
+are not implemented. The tested model above fits the local GPU; Qwen3-0.6B's default
+context exceeded its KV capacity in the verification environment.
 
 ## Testing
 
 ```bash
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
-cargo test
+cargo test --all
 ```
 
-The real-vLLM end-to-end test is gated behind an env var so it never runs by accident
-on a machine without a GPU. It exercises the full lifecycle — start, query, Ctrl-C
-cancellation, killing the daemon and confirming session metadata survives the restart,
-and killing the vLLM worker directly and confirming the session is reported `stopped`
-(never silently `active`, never wrongly `failed`):
+The real-vLLM tests use the locally built binary, isolated data roots, and
+`Qwen/Qwen2.5-0.5B-Instruct`. They cover worker crashes before a query, before output,
+after an exchange, and after a partial flush; daemon restarts during/after recovery;
+Ctrl-C, disconnect, startup failure, and recovery cancellation. Teardown signals only
+verified test-owned workers and direct-child daemons.
 
 ```bash
 RALPH_E2E_VLLM=1 cargo test --test e2e_vllm -- --ignored --test-threads=1
 ```
+
+See [Phase 2 verification](docs/phase2-verification.md) for the hardware acceptance
+results and the isolated manual recovery demo.

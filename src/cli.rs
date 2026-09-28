@@ -56,6 +56,11 @@ pub enum Command {
         /// Session name, id, or a unique id prefix. Typos get a "did you mean" suggestion.
         session: String,
     },
+    /// Reconstruct a session onto a fresh worker after its worker was lost
+    Recover {
+        /// Session name, id, or a unique id prefix.
+        session: String,
+    },
     /// Check the local environment (GPU, vLLM, disk, sqlite) — never mutates anything
     Doctor,
     /// Internal: run the daemon loop in the foreground. Not part of the public surface.

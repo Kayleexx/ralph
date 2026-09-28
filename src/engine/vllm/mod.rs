@@ -1,8 +1,10 @@
 //! vLLM adapter: spawns the vLLM server as a subprocess and talks to it only over its
-//! localhost HTTP API. One subprocess per session, reused for every query against it —
+//! localhost HTTP API. One subprocess shared by compatible sessions and queries —
 //! never shelled out to per request.
-use std::fs::File;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::net::TcpListener;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
@@ -11,12 +13,17 @@ use std::time::{Duration, Instant};
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot};
 
-use super::{Engine, EngineError, GenerationHandle, HealthStatus, ModelSpec, ResolvedModel, hub};
+use super::{
+    ChatMessage, Engine, EngineError, GenerationHandle, HealthStatus, ModelSpec, ResolvedModel, hub,
+};
 use stream::stream_completion;
 
+mod diagnostics;
+pub(crate) mod ownership;
 mod stream;
 #[cfg(test)]
 mod tests;
+mod tokenize;
 
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(500);
 // vLLM's cold start (import torch, init CUDA, spawn the EngineCore subprocess, load
@@ -24,7 +31,6 @@ const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(500);
 // 120s was cutting that close enough to fail on a healthy, still-loading worker. This is
 // a ceiling against a genuinely stuck process, not a tuned "typical" duration.
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(300);
-const STOP_GRACE_PERIOD: Duration = Duration::from_secs(3);
 // vLLM's own default (0.9) pre-allocates most of the GPU's memory up front, which fails
 // outright on a workstation where something else (a desktop compositor, browser, etc.) is
 // already holding a slice of a small GPU's VRAM. A lower default leaves headroom for that
@@ -39,6 +45,7 @@ pub struct VllmEngine {
     // vLLM validates it against the served model and 404s on a mismatch.
     model: String,
     child: Option<Child>,
+    owned: Option<ownership::Ownership>,
 }
 
 impl VllmEngine {
@@ -49,6 +56,7 @@ impl VllmEngine {
             base_url: String::new(),
             model: String::new(),
             child: None,
+            owned: None,
         }
     }
 }
@@ -106,6 +114,8 @@ fn vllm_serve_args(model: &str, port: u16, revision: Option<&str>) -> Vec<String
     if let Some(revision) = revision {
         args.push("--revision".to_string());
         args.push(revision.to_string());
+        args.push("--tokenizer-revision".to_string());
+        args.push(revision.to_string());
     }
     args
 }
@@ -116,14 +126,30 @@ impl Engine for VllmEngine {
         self.base_url = format!("http://127.0.0.1:{port}");
         self.model = spec.model.clone();
 
-        let stdout_log = File::create(&self.log_path)?;
+        let revision = match &spec.revision {
+            Some(revision) => Some(revision.clone()),
+            None => hub::resolve_revision(&self.client, &spec.model, None).await,
+        };
+        if revision.is_none() {
+            return Err(EngineError::BadResponse("cannot resolve immutable model revision; retry when the model cache or Hub is available".into()));
+        }
+        let nonce = ulid::Ulid::new().to_string();
+        let mut stdout_log = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(&self.log_path)?;
+        writeln!(stdout_log, "\n--- Ralph startup {nonce} ---")?;
         let stderr_log = stdout_log.try_clone()?;
 
         let mut cmd = Command::new(resolve_vllm_binary());
-        cmd.args(vllm_serve_args(&spec.model, port, spec.revision.as_deref()));
+        cmd.args(vllm_serve_args(&spec.model, port, revision.as_deref()));
         // FlashInfer's sampler JIT-compiles a CUDA kernel on first use, which needs the
         // full CUDA toolkit (nvcc) rather than just the driver — not something Ralph
         // should require on a workstation that only has the driver installed.
+        cmd.env("RALPH_WORKER_OWNER", &nonce);
+        // setproctitle otherwise overwrites /proc/environ and erases ownership markers.
+        cmd.env("SPT_NOENV", "1");
         cmd.env("VLLM_USE_FLASHINFER_SAMPLER", "0");
         // The /sleep, /wake_up, /is_sleeping routes are only mounted in vLLM's "dev"
         // router when this is set — without it they 404 even with --enable-sleep-mode.
@@ -138,13 +164,33 @@ impl Engine for VllmEngine {
         cmd.process_group(0);
         self.child = Some(cmd.spawn()?);
 
-        self.wait_until_healthy().await?;
+        let pid = self
+            .child
+            .as_ref()
+            .and_then(|c| c.id())
+            .ok_or_else(|| EngineError::BadResponse("spawned worker has no PID".into()))?;
+        self.owned = Some(ownership::Ownership::new(
+            pid,
+            nonce,
+            self.base_url.clone(),
+            self.model.clone(),
+            revision.clone(),
+        )?);
+        if let Some(owned) = &self.owned {
+            owned.save(&self.log_path.with_file_name("worker.json"))?;
+        }
+        if let Err(error) = self.wait_until_healthy().await {
+            let tail = diagnostics::tail(&self.log_path);
+            let cause = diagnostics::cause(&tail).unwrap_or_else(|| error.to_string());
+            self.stop_model().await?;
+            return Err(EngineError::Startup {
+                model: self.model.clone(),
+                cause,
+                diagnostic: format!("log: {}\n{tail}", self.log_path.display()),
+            });
+        }
 
-        // vLLM's own /v1/models doesn't expose a resolvable git revision distinct from
-        // the model id, so the real commit sha is resolved from the Hub API instead;
-        // `None` (never the model id itself) when that can't be done.
-        let revision =
-            hub::resolve_revision(&self.client, &spec.model, spec.revision.as_deref()).await;
+        // Model and tokenizer were pinned to the immutable revision before spawn.
         let engine_version = self.fetch_version().await;
 
         Ok(ResolvedModel {
@@ -166,14 +212,19 @@ impl Engine for VllmEngine {
         }
     }
 
-    async fn generate(&self, prompt: &str) -> Result<GenerationHandle, EngineError> {
+    async fn generate(&self, messages: &[ChatMessage]) -> Result<GenerationHandle, EngineError> {
         let (tx, rx) = mpsc::channel(32);
         let (cancel_tx, cancel_rx) = oneshot::channel();
         // Chat completions, not raw completions: a bare prompt string gives an
         // instruction-tuned model no chat template and no natural stopping point, so it
-        // just fills the token budget with unrelated filler. Sending it as a one-turn
-        // conversation lets vLLM apply the model's own chat template and stop tokens.
+        // just fills the token budget with unrelated filler. Sending the full turn
+        // history lets vLLM apply the model's own chat template and stop tokens, and lets
+        // a recovered session continue as one conversation rather than starting fresh.
         let url = format!("{}/v1/chat/completions", self.base_url);
+        let messages: Vec<serde_json::Value> = messages
+            .iter()
+            .map(|m| serde_json::json!({"role": m.role.as_str(), "content": m.content}))
+            .collect();
         // No `max_tokens`: omitting it entirely (rather than hardcoding a value that's
         // wrong for every model with a different context window) lets vLLM compute the
         // real per-request ceiling itself — max_model_len minus the prompt's token count
@@ -181,8 +232,9 @@ impl Engine for VllmEngine {
         // limit, whichever comes first, instead of an arbitrary fixed cutoff.
         let body = serde_json::json!({
             "model": self.model,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": messages,
             "stream": true,
+            "return_token_ids": true,
         });
         let client = self.client.clone();
         tokio::spawn(stream_completion(client, url, body, tx, cancel_rx));
@@ -244,33 +296,31 @@ impl Engine for VllmEngine {
             .unwrap_or(false)
     }
 
+    async fn prefill(&self, messages: &[ChatMessage]) -> Result<(), EngineError> {
+        self.prefill_chat(messages).await
+    }
+
+    async fn tokenize(&self, messages: &[ChatMessage]) -> Result<super::Tokenized, EngineError> {
+        self.tokenize_chat(messages).await
+    }
+    async fn encode(&self, text: &str) -> Result<Vec<u32>, EngineError> {
+        self.encode_text(text).await
+    }
     async fn stop_model(&mut self) -> Result<(), EngineError> {
-        let Some(child) = &mut self.child else {
-            return Ok(());
-        };
-        if let Some(pid) = child.id() {
-            // Signaling the process group (negative pid), not just the direct child,
-            // reaches vLLM's separately-spawned EngineCore worker too — otherwise it's
-            // orphaned and keeps holding GPU memory. SIGTERM first via a `kill`
-            // subprocess (avoids any unsafe libc call), then SIGKILL the group if it
-            // doesn't exit within the grace period.
-            let _ = Command::new("kill")
-                .args(["-TERM", &format!("-{pid}")])
-                .status()
-                .await;
-            let deadline = Instant::now() + STOP_GRACE_PERIOD;
-            while Instant::now() < deadline {
-                if matches!(child.try_wait(), Ok(Some(_))) {
-                    return Ok(());
-                }
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-            let _ = Command::new("kill")
-                .args(["-KILL", &format!("-{pid}")])
-                .status()
-                .await;
+        if let Some(owned) = &self.owned {
+            owned.cleanup()?;
         }
-        child.wait().await?;
+        if let Some(child) = &mut self.child {
+            child.wait().await?;
+        }
+        self.child = None;
+        self.owned = None;
+        let path = self.log_path.with_file_name("worker.json");
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
         Ok(())
     }
 
@@ -295,9 +345,9 @@ impl VllmEngine {
             if let Some(child) = &mut self.child
                 && let Ok(Some(status)) = child.try_wait()
             {
-                return Err(self.detect_oom().unwrap_or_else(|| {
-                    EngineError::WorkerExited(format!("exited during startup: {status}"))
-                }));
+                return Err(EngineError::WorkerExited(format!(
+                    "exited during startup: {status}"
+                )));
             }
             let reason = match self.health().await {
                 HealthStatus::Healthy => return Ok(()),
@@ -308,10 +358,7 @@ impl VllmEngine {
             }
             tokio::time::sleep(HEALTH_POLL_INTERVAL).await;
         };
-        let _ = self.stop_model().await;
-        Err(self
-            .detect_oom()
-            .unwrap_or(EngineError::HealthTimeout(last_reason)))
+        Err(EngineError::HealthTimeout(last_reason))
     }
 
     async fn fetch_version(&self) -> Option<String> {
@@ -325,16 +372,5 @@ impl VllmEngine {
         json.get("version")
             .and_then(|v| v.as_str())
             .map(String::from)
-    }
-
-    /// Scans the worker's own log for an out-of-memory message. Best-effort: vLLM's exact
-    /// OOM wording can vary between versions, so this only sharpens the error message —
-    /// a miss still falls back to the generic startup-failure error.
-    fn detect_oom(&self) -> Option<EngineError> {
-        let contents = std::fs::read_to_string(&self.log_path).ok()?;
-        let line = contents
-            .lines()
-            .find(|l| l.to_lowercase().contains("out of memory"))?;
-        Some(EngineError::OutOfMemory(line.trim().to_string()))
     }
 }
