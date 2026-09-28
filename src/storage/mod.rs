@@ -11,6 +11,7 @@ use thiserror::Error;
 use crate::state::SessionState;
 use crate::typo::suggest_similar;
 
+mod migrate;
 #[cfg(test)]
 mod tests;
 
@@ -92,6 +93,10 @@ impl Storage {
         if check != "ok" {
             return Err(StorageError::Corrupt(check));
         }
+        // Must run before the `CREATE TABLE IF NOT EXISTS` below: for an existing
+        // database on an older schema, this brings it up to date; for a brand-new one,
+        // it's a no-op and the create below does the real work.
+        migrate::run(&conn)?;
         conn.execute(SCHEMA, [])?;
         Ok(Self { conn })
     }
@@ -99,6 +104,7 @@ impl Storage {
     #[cfg(test)]
     pub fn open_in_memory() -> Result<Self, StorageError> {
         let conn = Connection::open_in_memory()?;
+        migrate::run(&conn)?;
         conn.execute(SCHEMA, [])?;
         Ok(Self { conn })
     }
@@ -143,8 +149,14 @@ impl Storage {
                 tx.commit()?;
                 Ok(())
             }
-            Err(rusqlite::Error::SqliteFailure(e, _))
-                if e.code == rusqlite::ErrorCode::ConstraintViolation =>
+            // Only a UNIQUE violation on `name` specifically is ever a duplicate name.
+            // Any other constraint failure (NOT NULL, a different UNIQUE index, ...) is
+            // a real, distinct bug and must never be misreported as one — that exact
+            // conflation is what silently turned a schema mismatch into a confusing
+            // "session already exists" for a name that had never been used.
+            Err(rusqlite::Error::SqliteFailure(e, Some(ref msg)))
+                if e.code == rusqlite::ErrorCode::ConstraintViolation
+                    && msg.contains("sessions.name") =>
             {
                 Err(StorageError::DuplicateName(row.name.clone()))
             }
