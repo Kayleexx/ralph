@@ -79,7 +79,7 @@ Durable history and token counts are committed together in SQLite WAL transactio
 Legacy sessions with missing token data report degraded recoverability and incomplete
 portable state; recovery preserves that evidence and refuses to invent history.
 
-Phase 2 reconstructs logical context; native KV checkpoints and cross-machine recovery
+Recovery reconstructs logical context; native KV checkpoints and cross-machine recovery
 are not implemented. The tested model above fits the local GPU; Qwen3-0.6B's default
 context exceeded its KV capacity in the verification environment.
 
@@ -110,6 +110,3 @@ verified test-owned workers and direct-child daemons.
 ```bash
 RALPH_E2E_VLLM=1 cargo test --test e2e_vllm -- --ignored --test-threads=1
 ```
-
-See [Phase 2 verification](docs/phase2-verification.md) for the hardware acceptance
-results and the isolated manual recovery demo.

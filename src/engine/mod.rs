@@ -1,5 +1,5 @@
 //! Engine adapter: the boundary between ralph and whatever process actually runs
-//! inference. Only the methods this phase calls are declared here — pause/resume/
+//! inference. Only methods used by the current implementation are declared here — pause/resume/
 //! checkpoint and a session-object concept get added once something actually implements
 //! and calls them.
 pub mod hub;

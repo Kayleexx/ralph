@@ -73,7 +73,7 @@ fn migrate_v1_nullable_model_revision(conn: &Connection) -> Result<(), StorageEr
     Ok(())
 }
 
-/// `token_turns` (Phase 2's durable turn history) didn't exist before this migration —
+/// `token_turns` (durable turn history) didn't exist before this migration —
 /// `CREATE TABLE IF NOT EXISTS` alone is enough here since there's no existing data to
 /// reshape, unlike `migrate_v1_nullable_model_revision`.
 fn migrate_v2_token_turns(conn: &Connection) -> Result<(), StorageError> {

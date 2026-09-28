@@ -27,7 +27,7 @@ mod tests_recovery;
 
 const SUPERVISOR_POLL_INTERVAL: Duration = Duration::from_millis(500);
 // How long a worker can go with no query against any of its sessions before it's put to
-// sleep. Sessions themselves never expire in Phase 1 (there's no `ralph stop`), so this
+// sleep. Sessions themselves never expire (there's no `ralph stop`), so this
 // is keyed on activity, not on the attached-session count reaching zero.
 const IDLE_SLEEP_AFTER: Duration = Duration::from_secs(300);
 

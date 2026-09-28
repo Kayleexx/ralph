@@ -141,8 +141,8 @@ impl<E: Engine + 'static> Daemon<E> {
     }
 
     /// Reconstructs `session`'s context from the durable token log and attaches it to a
-    /// live worker. Accepts sessions left `Recovering` (crash/restart) or `Stopped`
-    /// (pre-Phase-2 demotion); `Failed` is never accepted — that's reserved for a
+    /// live worker. Accepts sessions left `Recovering` (crash/restart) or `Stopped`;
+    /// `Failed` is never accepted — that's reserved for a
     /// genuinely unrecoverable session, not infrastructure flakiness (Invariant 5).
     #[cfg(test)]
     pub async fn recover(self: &Arc<Self>, identifier: &str) -> Result<SessionInfo, CliError> {

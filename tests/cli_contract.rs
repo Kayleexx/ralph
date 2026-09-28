@@ -6,7 +6,7 @@
 //! Each test gets its own isolated `XDG_DATA_HOME`, so it gets its own daemon and never
 //! touches a real one. That daemon is auto-started and left running for the OS to reap
 //! when the test's temp directory's socket path stops being reachable — there is no
-//! `ralph daemon stop` in this phase to tear it down explicitly.
+//! `ralph daemon stop` command to tear it down explicitly.
 use std::process::Command as StdCommand;
 
 use assert_cmd::Command;

@@ -1,9 +1,6 @@
 //! Session lifecycle state machine.
 //!
-//! The full lifecycle is defined now so later phases don't need to widen this enum (and
-//! touch every match arm / storage serialization). This phase only ever constructs
-//! `Created`, `Starting`, `Active`, `Recovering`, `Failed`, and `Stopped` — the rest have no valid
-//! transition into them yet.
+//! Reserved states retain stable serialization but have no valid transitions yet.
 use std::fmt;
 use std::str::FromStr;
 
@@ -14,17 +11,17 @@ pub enum SessionState {
     Created,
     Starting,
     Active,
-    /// Reserved for Phase 3 (pause/resume). Not constructed in Phase 1.
+    /// Reserved for pause/resume; currently unreachable.
     Pausing,
-    /// Reserved for Phase 3 (pause/resume). Not constructed in Phase 1.
+    /// Reserved for pause/resume; currently unreachable.
     Paused,
-    /// Reserved for Phase 3 (pause/resume). Not constructed in Phase 1.
+    /// Reserved for pause/resume; currently unreachable.
     Resuming,
-    /// Reserved for Phase 4 (hibernation). Not constructed in Phase 1.
+    /// Reserved for hibernation; currently unreachable.
     Hibernated,
     /// Worker loss or an explicit recovery attempt.
     Recovering,
-    /// Reserved for Phase 6 (handoff/drain). Not constructed in Phase 1.
+    /// Reserved for handoff/drain; currently unreachable.
     Moving,
     Failed,
     Stopped,
@@ -91,9 +88,7 @@ pub struct StateError {
     pub to: SessionState,
 }
 
-/// Validates lifecycle transitions through Phase 2;
-/// everything else fails closed with a typed error rather than panicking, since several
-/// `(from, to)` pairs are legitimately unreachable until later phases implement them.
+/// Validates supported lifecycle transitions; reserved operations fail closed.
 pub fn validate_transition(from: SessionState, to: SessionState) -> Result<(), StateError> {
     use SessionState::*;
     match (from, to) {
@@ -108,7 +103,7 @@ pub fn validate_transition(from: SessionState, to: SessionState) -> Result<(), S
         // reserved for a genuinely unrecoverable session-level failure, distinct from
         // the ordinary worker-gone case above.
         (Active, Failed) => Ok(()),
-        // Phase 2: worker lost mid-session (crash detected) or found orphaned after a
+        // Worker lost mid-session (crash detected) or found orphaned after a
         // daemon restart — the logical session survives, it just needs `ralph recover`.
         (Active, Recovering) => Ok(()),
         (Starting, Recovering) => Ok(()),
@@ -128,7 +123,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn valid_phase1_transitions_succeed() {
+    fn valid_startup_transitions_succeed() {
         assert!(validate_transition(SessionState::Created, SessionState::Starting).is_ok());
         assert!(validate_transition(SessionState::Starting, SessionState::Active).is_ok());
         assert!(validate_transition(SessionState::Starting, SessionState::Failed).is_ok());
@@ -137,7 +132,7 @@ mod tests {
     }
 
     #[test]
-    fn valid_phase2_recovery_transitions_succeed() {
+    fn valid_recovery_transitions_succeed() {
         assert!(validate_transition(SessionState::Active, SessionState::Recovering).is_ok());
         assert!(validate_transition(SessionState::Starting, SessionState::Recovering).is_ok());
         assert!(validate_transition(SessionState::Recovering, SessionState::Active).is_ok());
@@ -160,7 +155,7 @@ mod tests {
     }
 
     #[test]
-    fn transitions_into_later_phase_states_are_rejected() {
+    fn transitions_into_reserved_states_are_rejected() {
         assert!(validate_transition(SessionState::Active, SessionState::Paused).is_err());
         assert!(validate_transition(SessionState::Paused, SessionState::Active).is_err());
         assert!(validate_transition(SessionState::Active, SessionState::Hibernated).is_err());

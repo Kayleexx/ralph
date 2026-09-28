@@ -168,7 +168,7 @@ async fn resolve_model_and_name(
 async fn send_with_progress(
     stream: &mut UnixStream,
     request: &Request,
-    phase: &str,
+    operation: &str,
 ) -> std::io::Result<Response> {
     let request_fut = client::send_request(stream, request);
     tokio::pin!(request_fut);
@@ -182,7 +182,7 @@ async fn send_with_progress(
             result = &mut request_fut => break result,
             _ = ticks.tick() => {
                 let elapsed = start.elapsed().as_secs();
-                eprint!("\r{phase}... {elapsed}s");
+                eprint!("\r{operation}... {elapsed}s");
                 let _ = std::io::stderr().flush();
                 printed = true;
             }
