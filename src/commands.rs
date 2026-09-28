@@ -21,6 +21,17 @@ pub(crate) fn arrow(cli: Flags) -> &'static str {
     if cli.no_color { "->" } else { "\u{2192}" }
 }
 
+/// Wraps `text` in an ANSI SGR code (e.g. `"36"` for cyan, `"2"` for dim) unless
+/// `--no-color` is set or stdout isn't a terminal — color must never leak into piped or
+/// redirected output, `--no-color` aside.
+pub(crate) fn style(cli: Flags, code: &str, text: &str) -> String {
+    if cli.no_color || !std::io::stdout().is_terminal() {
+        text.to_string()
+    } else {
+        format!("\x1b[{code}m{text}\x1b[0m")
+    }
+}
+
 /// `model@revision` when a real, distinct revision is known; otherwise just the model id
 /// — never a fake revision equal to the model id itself.
 pub(crate) fn format_model_ref(model: &str, revision: Option<&str>) -> String {
@@ -191,7 +202,11 @@ pub async fn run_run(home: &Path, cli: Flags, model: Option<String>, name: Optio
             } else if cli.quiet {
                 println!("{}", info.name);
             } else {
-                println!("{} {} ready", ok_mark(cli), info.name);
+                println!(
+                    "{} {} ready",
+                    style(cli, "32", ok_mark(cli)),
+                    style(cli, "1", &info.name)
+                );
                 println!(
                     "  model: {}",
                     format_model_ref(&info.model, info.model_revision.as_deref())
@@ -260,10 +275,11 @@ pub async fn run_ps(home: &Path, cli: Flags) -> i32 {
                     arrow(cli)
                 );
             } else {
-                println!(
+                let header = format!(
                     "{:<16} {:<24} {:>8} {:<10} LOCATION",
                     "NAME", "MODEL", "TOKENS", "STATE"
                 );
+                println!("{}", style(cli, "2", &header));
                 for s in &sessions {
                     println!(
                         "{:<16} {:<24} {:>8} {:<10} {}",

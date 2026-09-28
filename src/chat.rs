@@ -6,7 +6,7 @@ use std::path::Path;
 
 use crate::cli::Flags;
 use crate::client;
-use crate::commands::{print_error, print_io_error, print_protocol_error};
+use crate::commands::{print_error, print_io_error, print_protocol_error, style};
 use crate::ipc::{Request, Response};
 
 pub async fn run_chat(home: &Path, cli: Flags, session: String) -> i32 {
@@ -43,12 +43,19 @@ pub async fn run_chat(home: &Path, cli: Flags, session: String) -> i32 {
 
     let is_tty = std::io::stdout().is_terminal();
     if is_tty {
-        println!("chatting with {session} — /exit or Ctrl-D to leave");
+        println!(
+            "{}\n",
+            style(
+                cli,
+                "2",
+                &format!("chatting with {session} — /exit or Ctrl-D to leave")
+            )
+        );
     }
 
     loop {
         if is_tty {
-            print!("> ");
+            print!("{} ", style(cli, "1;36", "\u{203a}"));
             let _ = std::io::stdout().flush();
         }
         let Some(line) = read_line().await else {
@@ -70,7 +77,9 @@ pub async fn run_chat(home: &Path, cli: Flags, session: String) -> i32 {
             }
         };
         match client::run_query(stream, &session, line, false).await {
-            Ok(client::QueryResult::Outcome(_)) => println!(),
+            // A blank line after the response, not just a newline, so turns read as
+            // distinct blocks instead of running into the next prompt.
+            Ok(client::QueryResult::Outcome(_)) => println!("\n"),
             Ok(client::QueryResult::Failed(payload)) => {
                 print_error(cli, &payload);
             }
