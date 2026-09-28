@@ -48,15 +48,31 @@ impl VllmEngine {
     }
 }
 
-/// Prefers the venv's vllm if present, so a machine that followed the documented setup
-/// works without touching PATH; falls back to whatever `vllm` resolves to otherwise.
+/// Checks, in order: an activated venv (`$VIRTUAL_ENV`, works from any directory once
+/// `source .venv/bin/activate` has run), a `.venv` in the current directory (works when
+/// `ralph` is run from inside the project without activating anything), then whatever
+/// `vllm` resolves to on `PATH`. `ralph` is often installed globally and run from
+/// wherever the user happens to be, so a CWD-relative check alone isn't enough.
 pub(crate) fn resolve_vllm_binary() -> PathBuf {
-    let venv_bin = Path::new(".venv/bin/vllm");
-    if venv_bin.exists() {
-        venv_bin.to_path_buf()
-    } else {
-        PathBuf::from("vllm")
+    resolve_vllm_binary_from(
+        std::env::var("VIRTUAL_ENV").ok(),
+        Path::new(".venv/bin/vllm"),
+    )
+}
+
+/// Split out so tests can control both inputs directly, rather than mutating the real
+/// `VIRTUAL_ENV` process environment (`std::env::set_var` is `unsafe` on this toolchain).
+fn resolve_vllm_binary_from(virtual_env: Option<String>, cwd_venv: &Path) -> PathBuf {
+    if let Some(venv) = virtual_env {
+        let candidate = PathBuf::from(venv).join("bin/vllm");
+        if candidate.exists() {
+            return candidate;
+        }
     }
+    if cwd_venv.exists() {
+        return cwd_venv.to_path_buf();
+    }
+    PathBuf::from("vllm")
 }
 
 fn pick_free_port() -> Result<u16, EngineError> {

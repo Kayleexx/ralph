@@ -8,6 +8,39 @@ fn free_ports_are_distinct() {
     assert_ne!(b, 0);
 }
 
+/// Regression test: `ralph` is installed globally and run from wherever the user
+/// happens to be, so vLLM discovery must not depend solely on the current directory
+/// happening to contain a `.venv`.
+#[test]
+fn resolve_vllm_binary_prefers_activated_virtual_env_over_cwd() {
+    let venv = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(venv.path().join("bin")).unwrap();
+    std::fs::write(venv.path().join("bin/vllm"), "").unwrap();
+
+    let missing_cwd_venv = Path::new("/nonexistent/for/this/test/.venv/bin/vllm");
+    let resolved =
+        resolve_vllm_binary_from(Some(venv.path().display().to_string()), missing_cwd_venv);
+    assert_eq!(resolved, venv.path().join("bin/vllm"));
+}
+
+#[test]
+fn resolve_vllm_binary_falls_back_to_cwd_venv_when_virtual_env_unset() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd_venv = dir.path().join(".venv/bin/vllm");
+    std::fs::create_dir_all(cwd_venv.parent().unwrap()).unwrap();
+    std::fs::write(&cwd_venv, "").unwrap();
+
+    let resolved = resolve_vllm_binary_from(None, &cwd_venv);
+    assert_eq!(resolved, cwd_venv);
+}
+
+#[test]
+fn resolve_vllm_binary_falls_back_to_path_when_nothing_else_exists() {
+    let missing = Path::new("/nonexistent/for/this/test/.venv/bin/vllm");
+    let resolved = resolve_vllm_binary_from(None, missing);
+    assert_eq!(resolved, PathBuf::from("vllm"));
+}
+
 /// Regression test for the raw-completion-vs-chat-template bug: `generate` must post
 /// to `/v1/chat/completions` with a `messages` array, never a bare `prompt` string —
 /// the latter gives instruction-tuned models no stopping point and no chat template.
