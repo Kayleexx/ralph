@@ -174,11 +174,15 @@ impl Engine for VllmEngine {
         // just fills the token budget with unrelated filler. Sending it as a one-turn
         // conversation lets vLLM apply the model's own chat template and stop tokens.
         let url = format!("{}/v1/chat/completions", self.base_url);
+        // No `max_tokens`: omitting it entirely (rather than hardcoding a value that's
+        // wrong for every model with a different context window) lets vLLM compute the
+        // real per-request ceiling itself — max_model_len minus the prompt's token count
+        // — so generation runs until the model's own stop token or its actual context
+        // limit, whichever comes first, instead of an arbitrary fixed cutoff.
         let body = serde_json::json!({
             "model": self.model,
             "messages": [{"role": "user", "content": prompt}],
             "stream": true,
-            "max_tokens": 128,
         });
         let client = self.client.clone();
         tokio::spawn(stream_completion(client, url, body, tx, cancel_rx));
