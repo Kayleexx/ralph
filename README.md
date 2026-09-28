@@ -91,6 +91,16 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all
 ```
 
+GitHub Actions runs these CPU checks on pull requests and pushes to `main`, using
+pinned Rust/actions, Swatinem dependency caching, and sccache. Only successful main
+pushes save dependency caches; PRs use sccache in read-only mode. Superseded runs cancel.
+GPU tests remain a separate hardware check.
+
+To enforce review of CI changes, protect `main` with the required `rust` check from
+GitHub Actions and code-owner approval, dismiss stale approvals, and disallow bypasses
+and force pushes. The `.github/CODEOWNERS` file assigns CI review to `@Kayleexx`;
+it needs those repository settings to enforce approval.
+
 The real-vLLM tests use the locally built binary, isolated data roots, and
 `Qwen/Qwen2.5-0.5B-Instruct`. They cover worker crashes before a query, before output,
 after an exchange, and after a partial flush; daemon restarts during/after recovery;
