@@ -1,0 +1,8 @@
+/target
+.venv/
+.claude/
+
+*.md
+!README.md
+!RALPH_SPEC.md
+!CLAUDE.md
