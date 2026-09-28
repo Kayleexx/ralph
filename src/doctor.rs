@@ -106,8 +106,25 @@ fn check_sqlite(ralph_home: &Path) -> CheckResult {
     }
 }
 
+/// Walks up to the nearest existing ancestor — `ralph_home` itself doesn't exist before
+/// the first `ralph run`, and free space on the filesystem it *would* live on is still a
+/// meaningful, non-mutating check.
+fn nearest_existing_ancestor(path: &Path) -> &Path {
+    let mut candidate = path;
+    loop {
+        if candidate.exists() {
+            return candidate;
+        }
+        match candidate.parent() {
+            Some(parent) => candidate = parent,
+            None => return candidate,
+        }
+    }
+}
+
 fn check_disk_space(ralph_home: &Path) -> CheckResult {
-    match fs2::available_space(ralph_home) {
+    let probe = nearest_existing_ancestor(ralph_home);
+    match fs2::available_space(probe) {
         Ok(bytes) if bytes >= MIN_FREE_DISK_BYTES => {
             pass("disk space", format!("{} MB free", bytes / 1024 / 1024))
         }
@@ -115,7 +132,7 @@ fn check_disk_space(ralph_home: &Path) -> CheckResult {
             "disk space",
             format!("only {} MB free", bytes / 1024 / 1024),
         ),
-        Err(e) => warn("disk space", e.to_string()),
+        Err(e) => warn("disk space", format!("{}: {e}", probe.display())),
     }
 }
 
@@ -212,6 +229,15 @@ mod tests {
             !dir.path().join("ralph.db").exists(),
             "doctor must not create ralph.db"
         );
+    }
+
+    #[test]
+    fn disk_space_check_passes_when_ralph_home_does_not_exist_yet() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("ralph_home").join("nested");
+        let result = check_disk_space(&missing);
+        assert_ne!(result.status, "fail", "detail: {}", result.detail);
+        assert!(!result.detail.contains("No such file or directory"));
     }
 
     #[test]

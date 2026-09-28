@@ -104,6 +104,28 @@ fn unrecognized_subcommand_is_a_usage_error() {
 }
 
 #[test]
+fn run_without_model_in_non_interactive_mode_is_a_concise_error() {
+    // `.output()` gives the child piped (non-TTY) stdin/stdout, so this exercises the
+    // same "not a real terminal" path a script or CI run would hit — it must fail fast
+    // with a clear error rather than hang waiting for interactive picker input.
+    let home = isolated_home();
+    let output = ralph(&home).arg("run").output().unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("no model specified"));
+}
+
+#[test]
+fn run_without_model_json_mode_is_a_concise_json_error() {
+    let home = isolated_home();
+    let output = ralph(&home).args(["--json", "run"]).output().unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let parsed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(parsed["error"]["exit_code"], 2);
+}
+
+#[test]
 fn doctor_json_is_an_array_of_check_results() {
     let home = isolated_home();
     let output = ralph(&home).args(["--json", "doctor"]).output().unwrap();

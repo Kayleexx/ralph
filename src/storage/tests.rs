@@ -5,7 +5,7 @@ fn sample_row(id: &str, name: &str) -> SessionRow {
         id: id.to_string(),
         name: name.to_string(),
         model: "Qwen/Qwen2.5-0.5B-Instruct".to_string(),
-        model_revision: "abc123".to_string(),
+        model_revision: Some("abc123".to_string()),
         tokenizer_revision: None,
         engine: "vllm".to_string(),
         engine_version: None,
@@ -55,7 +55,20 @@ fn ambiguous_prefix_is_rejected() {
 fn unknown_session_is_not_found() {
     let storage = Storage::open_in_memory().unwrap();
     let err = storage.resolve("nope").unwrap_err();
-    assert!(matches!(err, StorageError::NotFound(_)));
+    assert!(matches!(err, StorageError::NotFound { .. }));
+}
+
+#[test]
+fn typo_in_session_name_is_suggested() {
+    let storage = Storage::open_in_memory().unwrap();
+    storage.insert(&sample_row("01AAA", "demo")).unwrap();
+    let err = storage.resolve("dem").unwrap_err();
+    match err {
+        StorageError::NotFound { suggestion, .. } => {
+            assert_eq!(suggestion, Some("demo".to_string()))
+        }
+        other => panic!("expected NotFound, got {other:?}"),
+    }
 }
 
 #[test]

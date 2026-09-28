@@ -121,7 +121,8 @@ impl<E: Engine + 'static> Daemon<E> {
             id: id.clone(),
             name,
             model: model.clone(),
-            model_revision: model.clone(),
+            // Unresolved until `start_model` succeeds and reports a real revision.
+            model_revision: None,
             tokenizer_revision: None,
             engine: "vllm".to_string(),
             engine_version: None,
@@ -148,7 +149,7 @@ impl<E: Engine + 'static> Daemon<E> {
                 self.transition(&id, SessionState::Starting, SessionState::Active, pid)?;
                 self.storage().set_resolved(
                     &id,
-                    &resolved.revision,
+                    resolved.revision.as_deref(),
                     resolved.engine_version.as_deref(),
                     &now_rfc3339(),
                 )?;

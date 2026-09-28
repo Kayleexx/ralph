@@ -13,8 +13,11 @@ pub enum CliError {
     Usage(String),
     #[error("session {0:?} already exists")]
     DuplicateName(String),
-    #[error("no session found matching {0:?}")]
-    NotFound(String),
+    #[error("no session found matching {identifier:?}")]
+    NotFound {
+        identifier: String,
+        suggestion: Option<String>,
+    },
     #[error("{0:?} matches more than one session: {1:?}")]
     AmbiguousPrefix(String, Vec<String>),
     #[error("session is not in a state that allows this: {0}")]
@@ -31,7 +34,13 @@ impl From<StorageError> for CliError {
     fn from(e: StorageError) -> Self {
         match e {
             StorageError::DuplicateName(name) => CliError::DuplicateName(name),
-            StorageError::NotFound(id) => CliError::NotFound(id),
+            StorageError::NotFound {
+                identifier,
+                suggestion,
+            } => CliError::NotFound {
+                identifier,
+                suggestion,
+            },
             StorageError::AmbiguousPrefix(id, matches) => CliError::AmbiguousPrefix(id, matches),
             StorageError::Busy => CliError::Resource("storage is busy, try again".to_string()),
             StorageError::Corrupt(detail) => CliError::Corrupt(detail),
@@ -49,7 +58,7 @@ impl From<StateError> for CliError {
 pub fn exit_code(err: &CliError) -> i32 {
     match err {
         CliError::Usage(_) | CliError::DuplicateName(_) => 2,
-        CliError::NotFound(_) | CliError::AmbiguousPrefix(_, _) => 3,
+        CliError::NotFound { .. } | CliError::AmbiguousPrefix(_, _) => 3,
         CliError::InvalidState(_) => 4,
         CliError::Resource(_) => 6,
         CliError::Corrupt(_) => 8,
@@ -91,10 +100,16 @@ pub fn envelope(err: &CliError) -> Envelope {
             detail: vec![],
             next: Some(format!("use a different --name, or: ralph inspect {name}")),
         },
-        CliError::NotFound(id) => Envelope {
-            summary: format!("no session found matching {id:?}"),
+        CliError::NotFound {
+            identifier,
+            suggestion,
+        } => Envelope {
+            summary: format!("no session found matching {identifier:?}"),
             detail: vec![],
-            next: Some("run: ralph ps".to_string()),
+            next: Some(match suggestion {
+                Some(name) => format!("did you mean: {name}?"),
+                None => "run: ralph ps".to_string(),
+            }),
         },
         CliError::AmbiguousPrefix(id, matches) => Envelope {
             summary: format!("{id:?} matches more than one session"),
@@ -131,7 +146,13 @@ mod tests {
     #[test]
     fn exit_codes_match_the_documented_table() {
         assert_eq!(exit_code(&CliError::DuplicateName("x".into())), 2);
-        assert_eq!(exit_code(&CliError::NotFound("x".into())), 3);
+        assert_eq!(
+            exit_code(&CliError::NotFound {
+                identifier: "x".into(),
+                suggestion: None
+            }),
+            3
+        );
         assert_eq!(exit_code(&CliError::AmbiguousPrefix("x".into(), vec![])), 3);
         assert_eq!(exit_code(&CliError::InvalidState("x".into())), 4);
         assert_eq!(exit_code(&CliError::Resource("x".into())), 6);
@@ -148,6 +169,26 @@ mod tests {
         assert!(ascii.starts_with('x'));
         assert!(unicode.contains('→'));
         assert!(ascii.contains("->"));
+    }
+
+    #[test]
+    fn not_found_with_suggestion_hints_did_you_mean() {
+        let err = CliError::NotFound {
+            identifier: "dem".to_string(),
+            suggestion: Some("demo".to_string()),
+        };
+        let env = envelope(&err);
+        assert_eq!(env.next.as_deref(), Some("did you mean: demo?"));
+    }
+
+    #[test]
+    fn not_found_without_suggestion_hints_ps() {
+        let err = CliError::NotFound {
+            identifier: "nope".to_string(),
+            suggestion: None,
+        };
+        let env = envelope(&err);
+        assert_eq!(env.next.as_deref(), Some("run: ralph ps"));
     }
 
     #[test]

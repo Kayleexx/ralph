@@ -12,7 +12,10 @@ use futures_util::StreamExt;
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot};
 
-use super::{Engine, EngineError, GenerationHandle, HealthStatus, ModelSpec, ResolvedModel};
+use super::{Engine, EngineError, GenerationHandle, HealthStatus, ModelSpec, ResolvedModel, hub};
+
+#[cfg(test)]
+mod tests;
 
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(120);
@@ -102,10 +105,11 @@ impl Engine for VllmEngine {
 
         self.wait_until_healthy().await?;
 
-        // vLLM's /v1/models does not expose a resolvable git revision distinct from the
-        // model id, so the requested revision (or model name, if none was given) is the
-        // most honest value available without a heavier model-registry lookup.
-        let revision = spec.revision.clone().unwrap_or_else(|| spec.model.clone());
+        // vLLM's own /v1/models doesn't expose a resolvable git revision distinct from
+        // the model id, so the real commit sha is resolved from the Hub API instead;
+        // `None` (never the model id itself) when that can't be done.
+        let revision =
+            hub::resolve_revision(&self.client, &spec.model, spec.revision.as_deref()).await;
         let engine_version = self.fetch_version().await;
 
         Ok(ResolvedModel {
@@ -130,14 +134,15 @@ impl Engine for VllmEngine {
     async fn generate(&self, prompt: &str) -> Result<GenerationHandle, EngineError> {
         let (tx, rx) = mpsc::channel(32);
         let (cancel_tx, cancel_rx) = oneshot::channel();
-        let url = format!("{}/v1/completions", self.base_url);
+        // Chat completions, not raw completions: a bare prompt string gives an
+        // instruction-tuned model no chat template and no natural stopping point, so it
+        // just fills the token budget with unrelated filler. Sending it as a one-turn
+        // conversation lets vLLM apply the model's own chat template and stop tokens.
+        let url = format!("{}/v1/chat/completions", self.base_url);
         let body = serde_json::json!({
             "model": self.model,
-            "prompt": prompt,
+            "messages": [{"role": "user", "content": prompt}],
             "stream": true,
-            // A raw completion prompt (no chat template) gives an instruction-tuned
-            // model no natural stopping point, so it will happily fill the whole budget
-            // with filler; a modest cap keeps a query from running for minutes.
             "max_tokens": 128,
         });
         let client = self.client.clone();
@@ -313,8 +318,10 @@ fn first_number(text: &str) -> Option<u32> {
     digits.parse().ok()
 }
 
-/// Drains complete SSE events (`\n\n`-terminated) out of `buf`, forwarding each event's
-/// text delta. Returns false once the receiver is gone or a `[DONE]` marker is seen.
+/// Drains complete SSE events (`\n\n`-terminated) out of `buf`, forwarding each chat
+/// completion chunk's text delta. Returns false once the receiver is gone or a `[DONE]`
+/// marker is seen. The first chunk carries only a role with empty content, and the last
+/// carries only a finish reason with no `content` key at all — both are silently skipped.
 async fn forward_complete_events(
     buf: &mut String,
     tx: &mpsc::Sender<Result<String, EngineError>>,
@@ -332,49 +339,16 @@ async fn forward_complete_events(
             let Ok(json) = serde_json::from_str::<serde_json::Value>(data) else {
                 continue;
             };
-            if let Some(text) = json["choices"][0]["text"].as_str()
-                && tx.send(Ok(text.to_string())).await.is_err()
-            {
+            let Some(text) = json["choices"][0]["delta"]["content"].as_str() else {
+                continue;
+            };
+            if text.is_empty() {
+                continue;
+            }
+            if tx.send(Ok(text.to_string())).await.is_err() {
                 return false;
             }
         }
     }
     true
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn free_ports_are_distinct() {
-        let a = pick_free_port().unwrap();
-        let b = pick_free_port().unwrap();
-        assert_ne!(a, 0);
-        assert_ne!(b, 0);
-    }
-
-    #[tokio::test]
-    async fn forwards_a_single_sse_event() {
-        let (tx, mut rx) = mpsc::channel(4);
-        let mut buf = "data: {\"choices\":[{\"text\":\"hi\"}]}\n\n".to_string();
-        assert!(forward_complete_events(&mut buf, &tx).await);
-        assert_eq!(rx.recv().await.unwrap().unwrap(), "hi");
-    }
-
-    #[tokio::test]
-    async fn stops_forwarding_on_done_marker() {
-        let (tx, mut rx) = mpsc::channel(4);
-        let mut buf = "data: [DONE]\n\n".to_string();
-        assert!(!forward_complete_events(&mut buf, &tx).await);
-        assert!(rx.try_recv().is_err());
-    }
-
-    #[tokio::test]
-    async fn leaves_incomplete_event_buffered() {
-        let (tx, _rx) = mpsc::channel(4);
-        let mut buf = "data: {\"choices\":[{\"text\":\"partial".to_string();
-        assert!(forward_complete_events(&mut buf, &tx).await);
-        assert!(buf.contains("partial"));
-    }
 }

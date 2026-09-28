@@ -2,6 +2,7 @@
 //! inference. Only the methods this phase calls are declared here — pause/resume/
 //! checkpoint and a session-object concept get added once something actually implements
 //! and calls them.
+pub mod hub;
 pub mod vllm;
 
 use std::future::Future;
@@ -38,7 +39,9 @@ pub struct ModelSpec {
 
 #[derive(Debug, Clone)]
 pub struct ResolvedModel {
-    pub revision: String,
+    /// `None` when the exact revision genuinely couldn't be resolved (offline, private
+    /// repo, etc.) — never a fake value pretending to be one.
+    pub revision: Option<String>,
     pub engine_version: Option<String>,
 }
 

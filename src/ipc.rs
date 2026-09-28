@@ -22,7 +22,7 @@ pub struct SessionInfo {
     pub id: String,
     pub name: String,
     pub model: String,
-    pub model_revision: String,
+    pub model_revision: Option<String>,
     pub engine_version: Option<String>,
     pub state: String,
     pub pid: Option<i64>,

@@ -26,7 +26,9 @@ impl FakeEngine {
 impl Engine for FakeEngine {
     async fn start_model(&mut self, spec: &ModelSpec) -> Result<ResolvedModel, EngineError> {
         Ok(ResolvedModel {
-            revision: spec.model.clone(),
+            // Deliberately distinct from `spec.model` — the real bug this guards against
+            // was the revision silently defaulting to the model id itself.
+            revision: Some(format!("{}-fake-rev", spec.model)),
             engine_version: Some("fake".to_string()),
         })
     }
@@ -102,7 +104,9 @@ async fn run_creates_an_active_session() {
         .unwrap();
     assert_eq!(info.name, "demo");
     assert_eq!(info.state, "active");
-    assert_eq!(info.model_revision, "model");
+    // Must be the engine's resolved revision, never a copy of the model id itself.
+    assert_eq!(info.model_revision, Some("model-fake-rev".to_string()));
+    assert_ne!(info.model_revision.as_deref(), Some(info.model.as_str()));
 }
 
 #[tokio::test]
@@ -110,7 +114,7 @@ async fn inspect_unknown_session_is_not_found() {
     let dir = tempfile::tempdir().unwrap();
     let daemon = test_daemon(dir.path());
     let err = daemon.inspect("nope").unwrap_err();
-    assert!(matches!(err, CliError::NotFound(_)));
+    assert!(matches!(err, CliError::NotFound { .. }));
 }
 
 #[tokio::test]
@@ -138,7 +142,7 @@ async fn query_on_non_active_session_is_rejected() {
     // via NotFound rather than a state check — a session can only reach Active through
     // `run`, so this also implicitly covers "not yet started".
     let result = daemon.begin_query("demo").await;
-    assert!(matches!(result, Err(CliError::NotFound(_))));
+    assert!(matches!(result, Err(CliError::NotFound { .. })));
 }
 
 #[tokio::test]

@@ -9,6 +9,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
 
 use crate::state::SessionState;
+use crate::typo::suggest_similar;
 
 #[cfg(test)]
 mod tests;
@@ -17,8 +18,11 @@ mod tests;
 pub enum StorageError {
     #[error("session name {0:?} already exists")]
     DuplicateName(String),
-    #[error("no session found matching {0:?}")]
-    NotFound(String),
+    #[error("no session found matching {identifier:?}")]
+    NotFound {
+        identifier: String,
+        suggestion: Option<String>,
+    },
     #[error("{0:?} matches more than one session: {1:?}")]
     AmbiguousPrefix(String, Vec<String>),
     #[error("storage is temporarily busy, try again")]
@@ -45,7 +49,9 @@ pub struct SessionRow {
     pub id: String,
     pub name: String,
     pub model: String,
-    pub model_revision: String,
+    /// `None` until resolved (or if it never could be) — never a fake value equal to
+    /// `model` itself.
+    pub model_revision: Option<String>,
     pub tokenizer_revision: Option<String>,
     pub engine: String,
     pub engine_version: Option<String>,
@@ -65,7 +71,7 @@ const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS sessions (
     id                  TEXT PRIMARY KEY,
     name                TEXT NOT NULL UNIQUE,
     model               TEXT NOT NULL,
-    model_revision      TEXT NOT NULL,
+    model_revision      TEXT,
     tokenizer_revision  TEXT,
     engine              TEXT NOT NULL,
     engine_version      TEXT,
@@ -167,7 +173,7 @@ impl Storage {
     pub fn set_resolved(
         &self,
         id: &str,
-        model_revision: &str,
+        model_revision: Option<&str>,
         engine_version: Option<&str>,
         updated_at: &str,
     ) -> Result<(), StorageError> {
@@ -215,7 +221,14 @@ impl Storage {
         }
         let matches = self.find_by_id_prefix(identifier)?;
         match matches.len() {
-            0 => Err(StorageError::NotFound(identifier.to_string())),
+            0 => {
+                let names = self.list()?.into_iter().map(|r| r.name).collect::<Vec<_>>();
+                let suggestion = suggest_similar(identifier, names.iter().map(String::as_str));
+                Err(StorageError::NotFound {
+                    identifier: identifier.to_string(),
+                    suggestion,
+                })
+            }
             1 => Ok(matches.into_iter().next().unwrap()),
             _ => Err(StorageError::AmbiguousPrefix(
                 identifier.to_string(),
