@@ -4,14 +4,22 @@
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "ralph", version)]
+#[command(
+    name = "ralph",
+    version,
+    about = "A continuity runtime for stateful LLM inference."
+)]
 pub struct Cli {
+    /// Machine-readable output on stdout only; no human decoration, stable field names.
     #[arg(long, global = true)]
     pub json: bool,
+    /// Print only the essential result (e.g. just the session name or state).
     #[arg(long, global = true)]
     pub quiet: bool,
+    /// Never emit color/unicode glyphs, even on a terminal that supports them.
     #[arg(long, global = true)]
     pub no_color: bool,
+    /// Show internal details (worker id, paths) — never prompt content.
     #[arg(short, long, global = true)]
     pub verbose: bool,
     #[command(subcommand)]
@@ -20,26 +28,35 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Start a model and create a session for it. With no model and an interactive
-    /// terminal, shows a small picker instead of failing.
+    /// Start a model and create a session for it (no model = interactive picker)
     Run {
+        /// Model id vLLM can serve (e.g. Qwen/Qwen2.5-0.5B-Instruct). Omit for the
+        /// interactive picker on a real terminal.
         model: Option<String>,
+        /// Session name. Omit to get a generated (or picker-suggested) one.
         #[arg(long)]
         name: Option<String>,
     },
-    /// Send a prompt to a session and stream the response.
+    /// Send a prompt to a session and stream the response (one-shot, scriptable)
     Query {
+        /// Session name, id, or a unique id prefix.
         session: String,
-        /// Read from stdin when omitted or "-".
+        /// The prompt text. Read from stdin when omitted or "-".
         prompt: Option<String>,
     },
-    /// Interactive human-facing session interface.
-    Chat { session: String },
-    /// List sessions.
+    /// Interactive back-and-forth with a session (/exit or Ctrl-D to leave)
+    Chat {
+        /// Session name, id, or a unique id prefix.
+        session: String,
+    },
+    /// List sessions
     Ps,
-    /// Show a session's lifecycle and recoverability.
-    Inspect { session: String },
-    /// Check the local environment.
+    /// Show a session's lifecycle and recoverability
+    Inspect {
+        /// Session name, id, or a unique id prefix. Typos get a "did you mean" suggestion.
+        session: String,
+    },
+    /// Check the local environment (GPU, vLLM, disk, sqlite) — never mutates anything
     Doctor,
     /// Internal: run the daemon loop in the foreground. Not part of the public surface.
     #[command(hide = true, name = "__daemon")]

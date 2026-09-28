@@ -154,7 +154,9 @@ async fn send_with_progress(
             biased;
             result = &mut request_fut => break result,
             _ = ticks.tick() => {
-                eprint!("\rstarting... {}s", start.elapsed().as_secs());
+                let elapsed = start.elapsed().as_secs();
+                let hint = if elapsed >= 20 { " (loading model weights, this can take a few minutes)" } else { "" };
+                eprint!("\rstarting... {elapsed}s{hint}");
                 let _ = std::io::stderr().flush();
                 printed = true;
             }

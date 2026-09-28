@@ -18,7 +18,11 @@ use super::{Engine, EngineError, GenerationHandle, HealthStatus, ModelSpec, Reso
 mod tests;
 
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(500);
-const HEALTH_TIMEOUT: Duration = Duration::from_secs(120);
+// vLLM's cold start (import torch, init CUDA, spawn the EngineCore subprocess, load
+// weights) routinely takes 60-150s+ even for a sub-1B model on a modest single GPU —
+// 120s was cutting that close enough to fail on a healthy, still-loading worker. This is
+// a ceiling against a genuinely stuck process, not a tuned "typical" duration.
+const HEALTH_TIMEOUT: Duration = Duration::from_secs(300);
 const STOP_GRACE_PERIOD: Duration = Duration::from_secs(3);
 // vLLM's own default (0.9) pre-allocates most of the GPU's memory up front, which fails
 // outright on a workstation where something else (a desktop compositor, browser, etc.) is
