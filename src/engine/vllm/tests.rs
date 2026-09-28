@@ -41,6 +41,51 @@ fn resolve_vllm_binary_falls_back_to_path_when_nothing_else_exists() {
     assert_eq!(resolved, PathBuf::from("vllm"));
 }
 
+#[test]
+fn serve_args_enable_sleep_mode() {
+    let args = vllm_serve_args("Qwen/Qwen2.5-0.5B-Instruct", 8000, None);
+    assert!(args.contains(&"--enable-sleep-mode".to_string()));
+    assert!(!args.contains(&"--revision".to_string()));
+}
+
+#[test]
+fn serve_args_include_revision_when_requested() {
+    let args = vllm_serve_args("model", 8000, Some("abc123"));
+    let pos = args.iter().position(|a| a == "--revision").unwrap();
+    assert_eq!(args[pos + 1], "abc123");
+}
+
+#[tokio::test]
+async fn is_sleeping_reflects_the_worker_response() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::task::spawn_blocking(move || {
+        use std::io::{Read, Write};
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 8192];
+        let _ = stream.read(&mut buf).unwrap();
+        let body = "{\"is_sleeping\":true}";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = stream.write_all(response.as_bytes());
+    });
+
+    let mut engine = VllmEngine::new(PathBuf::from("/dev/null"));
+    engine.base_url = format!("http://{addr}");
+    assert!(engine.is_sleeping().await);
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn is_sleeping_is_false_when_the_worker_is_unreachable() {
+    let mut engine = VllmEngine::new(PathBuf::from("/dev/null"));
+    engine.base_url = "http://127.0.0.1:1".to_string(); // nothing listens here
+    assert!(!engine.is_sleeping().await);
+}
+
 /// Regression test for the raw-completion-vs-chat-template bug: `generate` must post
 /// to `/v1/chat/completions` with a `messages` array, never a bare `prompt` string —
 /// the latter gives instruction-tuned models no stopping point and no chat template.
@@ -75,49 +120,4 @@ async fn generate_sends_chat_completions_request_with_messages() {
     assert!(request.contains("POST /v1/chat/completions"));
     assert!(request.contains("\"messages\""));
     assert!(!request.contains("\"prompt\":"));
-}
-
-#[tokio::test]
-async fn forwards_a_single_chat_delta() {
-    let (tx, mut rx) = mpsc::channel(4);
-    let mut buf = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n".to_string();
-    assert!(forward_complete_events(&mut buf, &tx).await);
-    assert_eq!(rx.recv().await.unwrap().unwrap(), "hi");
-}
-
-#[tokio::test]
-async fn stops_forwarding_on_done_marker() {
-    let (tx, mut rx) = mpsc::channel(4);
-    let mut buf = "data: [DONE]\n\n".to_string();
-    assert!(!forward_complete_events(&mut buf, &tx).await);
-    assert!(rx.try_recv().is_err());
-}
-
-#[tokio::test]
-async fn leaves_incomplete_event_buffered() {
-    let (tx, _rx) = mpsc::channel(4);
-    let mut buf = "data: {\"choices\":[{\"delta\":{\"content\":\"partial".to_string();
-    assert!(forward_complete_events(&mut buf, &tx).await);
-    assert!(buf.contains("partial"));
-}
-
-#[tokio::test]
-async fn skips_role_only_opening_chunk() {
-    // The first chat-completion chunk carries the role with empty content — it must
-    // not be forwarded as a real (empty) token.
-    let (tx, mut rx) = mpsc::channel(4);
-    let mut buf = "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}\n\n"
-        .to_string();
-    assert!(forward_complete_events(&mut buf, &tx).await);
-    assert!(rx.try_recv().is_err());
-}
-
-#[tokio::test]
-async fn skips_finish_reason_only_closing_chunk() {
-    // The last chunk before [DONE] typically has an empty delta and a finish_reason,
-    // with no "content" key at all.
-    let (tx, mut rx) = mpsc::channel(4);
-    let mut buf = "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n".to_string();
-    assert!(forward_complete_events(&mut buf, &tx).await);
-    assert!(rx.try_recv().is_err());
 }

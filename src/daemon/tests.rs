@@ -13,12 +13,14 @@ use crate::engine::{GenerationHandle, HealthStatus, ResolvedModel};
 /// transitions, reconciliation) can be tested without vLLM or a GPU.
 struct FakeEngine {
     exited: Arc<AtomicBool>,
+    sleeping: Arc<AtomicBool>,
 }
 
 impl FakeEngine {
     fn new(_log_path: PathBuf) -> Self {
         FakeEngine {
             exited: Arc::new(AtomicBool::new(false)),
+            sleeping: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -45,6 +47,20 @@ impl Engine for FakeEngine {
             tokens: rx,
             cancel: cancel_tx,
         })
+    }
+
+    async fn sleep(&mut self) -> Result<(), EngineError> {
+        self.sleeping.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn wake_up(&mut self) -> Result<(), EngineError> {
+        self.sleeping.store(false, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn is_sleeping(&self) -> bool {
+        self.sleeping.load(Ordering::SeqCst)
     }
 
     async fn stop_model(&mut self) -> Result<(), EngineError> {
@@ -197,4 +213,81 @@ async fn generate_does_not_deadlock_with_supervisor_running() {
         result.is_ok(),
         "generate() timed out acquiring the engine lock"
     );
+}
+
+#[tokio::test]
+async fn two_sessions_for_the_same_model_share_one_worker() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = test_daemon(dir.path());
+    let a = daemon
+        .run("shared-model".to_string(), Some("a".to_string()))
+        .await
+        .unwrap();
+    let b = daemon
+        .run("shared-model".to_string(), Some("b".to_string()))
+        .await
+        .unwrap();
+
+    assert_eq!(daemon.workers.lock().await.len(), 1, "only one worker");
+    assert_eq!(a.model_revision, b.model_revision, "same resolved worker");
+
+    let qa = daemon.begin_query("a").await.unwrap();
+    let qb = daemon.begin_query("b").await.unwrap();
+    assert!(
+        Arc::ptr_eq(&qa.engine, &qb.engine),
+        "both sessions must be handed the same underlying engine"
+    );
+}
+
+#[tokio::test]
+async fn worker_crash_demotes_every_attached_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = test_daemon(dir.path());
+    daemon
+        .run("shared-model".to_string(), Some("a".to_string()))
+        .await
+        .unwrap();
+    daemon
+        .run("shared-model".to_string(), Some("b".to_string()))
+        .await
+        .unwrap();
+
+    let exited = {
+        let workers = daemon.workers.lock().await;
+        let entry = workers.get("shared-model").unwrap();
+        entry.engine.lock().await.exited.clone()
+    };
+    exited.store(true, Ordering::SeqCst);
+
+    // Poll rather than sleep a fixed amount: wait for the supervisor to actually notice.
+    for _ in 0..50 {
+        if daemon.inspect("a").unwrap().session.state == "stopped" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(daemon.inspect("a").unwrap().session.state, "stopped");
+    assert_eq!(daemon.inspect("b").unwrap().session.state, "stopped");
+    assert!(daemon.workers.lock().await.get("shared-model").is_none());
+}
+
+#[tokio::test]
+async fn begin_query_wakes_a_sleeping_worker() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = test_daemon(dir.path());
+    daemon
+        .run("model".to_string(), Some("demo".to_string()))
+        .await
+        .unwrap();
+
+    let sleeping = {
+        let workers = daemon.workers.lock().await;
+        let entry = workers.get("model").unwrap();
+        entry.engine.lock().await.sleep().await.unwrap();
+        entry.engine.lock().await.sleeping.clone()
+    };
+    assert!(sleeping.load(Ordering::SeqCst));
+
+    daemon.begin_query("demo").await.unwrap();
+    assert!(!sleeping.load(Ordering::SeqCst), "query must wake it");
 }

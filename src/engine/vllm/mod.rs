@@ -8,12 +8,13 @@ use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
-use futures_util::StreamExt;
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot};
 
 use super::{Engine, EngineError, GenerationHandle, HealthStatus, ModelSpec, ResolvedModel, hub};
+use stream::stream_completion;
 
+mod stream;
 #[cfg(test)]
 mod tests;
 
@@ -84,6 +85,31 @@ fn pick_free_port() -> Result<u16, EngineError> {
     Ok(listener.local_addr()?.port())
 }
 
+/// Split out for testability: the exact flags passed to `vllm serve`.
+fn vllm_serve_args(model: &str, port: u16, revision: Option<&str>) -> Vec<String> {
+    let mut args = vec![
+        "serve".to_string(),
+        model.to_string(),
+        "--port".to_string(),
+        port.to_string(),
+        "--gpu-memory-utilization".to_string(),
+        GPU_MEMORY_UTILIZATION.to_string(),
+        // Skips CUDA graph capture, which otherwise dominates startup time (tens of
+        // seconds even for a small model) — favors fast, repeatable session startup
+        // over the last bit of decode throughput.
+        "--enforce-eager".to_string(),
+        // Lets a worker be put to sleep (weights offloaded to host RAM, GPU freed)
+        // instead of killed when idle, and woken again in well under a second — see
+        // `sleep`/`wake_up`/`is_sleeping` below.
+        "--enable-sleep-mode".to_string(),
+    ];
+    if let Some(revision) = revision {
+        args.push("--revision".to_string());
+        args.push(revision.to_string());
+    }
+    args
+}
+
 impl Engine for VllmEngine {
     async fn start_model(&mut self, spec: &ModelSpec) -> Result<ResolvedModel, EngineError> {
         let port = pick_free_port()?;
@@ -94,25 +120,14 @@ impl Engine for VllmEngine {
         let stderr_log = stdout_log.try_clone()?;
 
         let mut cmd = Command::new(resolve_vllm_binary());
-        cmd.args([
-            "serve",
-            &spec.model,
-            "--port",
-            &port.to_string(),
-            "--gpu-memory-utilization",
-            GPU_MEMORY_UTILIZATION,
-            // Skips CUDA graph capture, which otherwise dominates startup time (tens of
-            // seconds even for a small model) — favors fast, repeatable session startup
-            // over the last bit of decode throughput.
-            "--enforce-eager",
-        ]);
-        if let Some(revision) = &spec.revision {
-            cmd.args(["--revision", revision]);
-        }
+        cmd.args(vllm_serve_args(&spec.model, port, spec.revision.as_deref()));
         // FlashInfer's sampler JIT-compiles a CUDA kernel on first use, which needs the
         // full CUDA toolkit (nvcc) rather than just the driver — not something Ralph
         // should require on a workstation that only has the driver installed.
         cmd.env("VLLM_USE_FLASHINFER_SAMPLER", "0");
+        // The /sleep, /wake_up, /is_sleeping routes are only mounted in vLLM's "dev"
+        // router when this is set — without it they 404 even with --enable-sleep-mode.
+        cmd.env("VLLM_SERVER_DEV_MODE", "1");
         cmd.stdout(Stdio::from(stdout_log));
         cmd.stderr(Stdio::from(stderr_log));
         cmd.kill_on_drop(true);
@@ -171,6 +186,58 @@ impl Engine for VllmEngine {
             tokens: rx,
             cancel: cancel_tx,
         })
+    }
+
+    async fn sleep(&mut self) -> Result<(), EngineError> {
+        let resp = self
+            .client
+            .post(format!("{}/sleep?level=1", self.base_url))
+            .send()
+            .await?;
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            Err(EngineError::BadResponse(format!(
+                "sleep request failed: {}",
+                resp.status()
+            )))
+        }
+    }
+
+    async fn wake_up(&mut self) -> Result<(), EngineError> {
+        let resp = self
+            .client
+            .post(format!("{}/wake_up", self.base_url))
+            .send()
+            .await?;
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            Err(EngineError::BadResponse(format!(
+                "wake_up request failed: {}",
+                resp.status()
+            )))
+        }
+    }
+
+    /// Best-effort: a request failure (worker briefly unreachable, dev-mode route
+    /// missing) reads as "not sleeping" rather than propagating an error, since callers
+    /// use this only to decide whether a wake-up call is needed before generating.
+    async fn is_sleeping(&self) -> bool {
+        let Ok(resp) = self
+            .client
+            .get(format!("{}/is_sleeping", self.base_url))
+            .send()
+            .await
+        else {
+            return false;
+        };
+        let Ok(json) = resp.json::<serde_json::Value>().await else {
+            return false;
+        };
+        json.get("is_sleeping")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
     }
 
     async fn stop_model(&mut self) -> Result<(), EngineError> {
@@ -266,109 +333,4 @@ impl VllmEngine {
             .find(|l| l.to_lowercase().contains("out of memory"))?;
         Some(EngineError::OutOfMemory(line.trim().to_string()))
     }
-}
-
-async fn stream_completion(
-    client: reqwest::Client,
-    url: String,
-    body: serde_json::Value,
-    tx: mpsc::Sender<Result<String, EngineError>>,
-    mut cancel_rx: oneshot::Receiver<()>,
-) {
-    let resp = match client.post(&url).json(&body).send().await {
-        Ok(r) => r,
-        Err(e) => {
-            let _ = tx.send(Err(EngineError::Request(e))).await;
-            return;
-        }
-    };
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body_text = resp.text().await.unwrap_or_default();
-        let _ = tx
-            .send(Err(classify_error_response(status, &body_text)))
-            .await;
-        return;
-    }
-    let mut stream = resp.bytes_stream();
-    let mut buf = String::new();
-    loop {
-        tokio::select! {
-            _ = &mut cancel_rx => return,
-            chunk = stream.next() => {
-                match chunk {
-                    Some(Ok(bytes)) => {
-                        buf.push_str(&String::from_utf8_lossy(&bytes));
-                        if !forward_complete_events(&mut buf, &tx).await {
-                            return;
-                        }
-                    }
-                    Some(Err(e)) => {
-                        let _ = tx.send(Err(EngineError::Request(e))).await;
-                        return;
-                    }
-                    None => return,
-                }
-            }
-        }
-    }
-}
-
-/// Best-effort classification of a non-success completion response. Context-length wording
-/// isn't standardized across vLLM versions, so this is a heuristic, not a guarantee — an
-/// unrecognized error still reaches the user as `BadResponse` rather than being dropped.
-fn classify_error_response(status: reqwest::StatusCode, body: &str) -> EngineError {
-    let lower = body.to_lowercase();
-    if lower.contains("maximum context length") || lower.contains("context_length_exceeded") {
-        let limit = first_number(body).unwrap_or(0);
-        return EngineError::ContextWindowExceeded { limit };
-    }
-    EngineError::BadResponse(format!(
-        "{status}: {}",
-        body.chars().take(300).collect::<String>()
-    ))
-}
-
-fn first_number(text: &str) -> Option<u32> {
-    let digits: String = text
-        .chars()
-        .skip_while(|c| !c.is_ascii_digit())
-        .take_while(|c| c.is_ascii_digit())
-        .collect();
-    digits.parse().ok()
-}
-
-/// Drains complete SSE events (`\n\n`-terminated) out of `buf`, forwarding each chat
-/// completion chunk's text delta. Returns false once the receiver is gone or a `[DONE]`
-/// marker is seen. The first chunk carries only a role with empty content, and the last
-/// carries only a finish reason with no `content` key at all — both are silently skipped.
-async fn forward_complete_events(
-    buf: &mut String,
-    tx: &mpsc::Sender<Result<String, EngineError>>,
-) -> bool {
-    while let Some(pos) = buf.find("\n\n") {
-        let event = buf[..pos].to_string();
-        buf.drain(..pos + 2);
-        for line in event.lines() {
-            let Some(data) = line.strip_prefix("data: ") else {
-                continue;
-            };
-            if data == "[DONE]" {
-                return false;
-            }
-            let Ok(json) = serde_json::from_str::<serde_json::Value>(data) else {
-                continue;
-            };
-            let Some(text) = json["choices"][0]["delta"]["content"].as_str() else {
-                continue;
-            };
-            if text.is_empty() {
-                continue;
-            }
-            if tx.send(Ok(text.to_string())).await.is_err() {
-                return false;
-            }
-        }
-    }
-    true
 }

@@ -4,12 +4,12 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as SyncMutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 use crate::doctor;
-use crate::engine::{Engine, EngineError, ModelSpec};
+use crate::engine::{Engine, EngineError, ModelSpec, ResolvedModel};
 use crate::error::CliError;
 use crate::ipc::{InspectInfo, SessionInfo};
 use crate::lock::SessionLocks;
@@ -21,6 +21,21 @@ use crate::storage::{SessionRow, Storage, StorageError};
 mod tests;
 
 const SUPERVISOR_POLL_INTERVAL: Duration = Duration::from_millis(500);
+// How long a worker can go with no query against any of its sessions before it's put to
+// sleep. Sessions themselves never expire in Phase 1 (there's no `ralph stop`), so this
+// is keyed on activity, not on the attached-session count reaching zero.
+const IDLE_SLEEP_AFTER: Duration = Duration::from_secs(300);
+
+/// One live vLLM process, potentially serving several Ralph sessions that all requested
+/// the same model. Keyed by model id in `Daemon::workers` — Phase 1 has no way to
+/// request a specific revision, so the model id alone is currently a unique enough key;
+/// pinning a revision later would need to become part of the key too.
+struct WorkerEntry<E: Engine> {
+    engine: Arc<AsyncMutex<E>>,
+    resolved: ResolvedModel,
+    session_ids: Vec<String>,
+    last_active: Instant,
+}
 
 fn now_rfc3339() -> String {
     time::OffsetDateTime::now_utc()
@@ -40,7 +55,8 @@ pub struct Daemon<E: Engine + 'static> {
     storage: SyncMutex<Storage>,
     sessions_root: PathBuf,
     locks: SessionLocks,
-    workers: AsyncMutex<HashMap<String, Arc<AsyncMutex<E>>>>,
+    // Keyed by model id, not session id — see `WorkerEntry`.
+    workers: AsyncMutex<HashMap<String, WorkerEntry<E>>>,
     make_engine: fn(PathBuf) -> E,
     has_gpu: fn() -> bool,
 }
@@ -138,9 +154,47 @@ impl<E: Engine + 'static> Daemon<E> {
             .map_err(|e| CliError::Other(e.into()))?;
         self.transition(&id, SessionState::Created, SessionState::Starting, None)?;
 
+        // Reuse a worker already serving this model (waking it first if it's asleep)
+        // instead of cold-starting a second vLLM process for the same weights.
+        let workers = self.workers.lock().await;
+        let reuse = workers
+            .get(&model)
+            .map(|entry| (entry.engine.clone(), entry.resolved.clone()));
+        drop(workers); // never held across the wake-up network round-trip below
+
+        if let Some((engine_handle, resolved)) = reuse {
+            if let Err(e) = wake_if_sleeping(&engine_handle).await {
+                self.transition(&id, SessionState::Starting, SessionState::Failed, None)?;
+                return Err(map_engine_error(e));
+            }
+            // Only attach this session to the worker once it's confirmed usable; the
+            // worker could have crashed and been evicted between the lookup above and
+            // now, in which case there's nothing to attach to.
+            let mut workers = self.workers.lock().await;
+            let Some(entry) = workers.get_mut(&model) else {
+                drop(workers);
+                self.transition(&id, SessionState::Starting, SessionState::Failed, None)?;
+                return Err(CliError::Resource(
+                    "worker exited while starting this session".to_string(),
+                ));
+            };
+            entry.session_ids.push(id.clone());
+            entry.last_active = Instant::now();
+            let pid = entry.engine.lock().await.pid().map(i64::from);
+            drop(workers);
+            self.transition(&id, SessionState::Starting, SessionState::Active, pid)?;
+            self.storage().set_resolved(
+                &id,
+                resolved.revision.as_deref(),
+                resolved.engine_version.as_deref(),
+                &now_rfc3339(),
+            )?;
+            return Ok(to_session_info(&self.storage().resolve(&id)?));
+        }
+
         let mut engine = (self.make_engine)(session::vllm_log_path(&dir));
         let spec = ModelSpec {
-            model,
+            model: model.clone(),
             revision: None,
         };
         match engine.start_model(&spec).await {
@@ -154,8 +208,16 @@ impl<E: Engine + 'static> Daemon<E> {
                     &now_rfc3339(),
                 )?;
                 let handle = Arc::new(AsyncMutex::new(engine));
-                self.workers.lock().await.insert(id.clone(), handle.clone());
-                self.spawn_supervisor(id.clone(), handle);
+                self.workers.lock().await.insert(
+                    model.clone(),
+                    WorkerEntry {
+                        engine: handle.clone(),
+                        resolved,
+                        session_ids: vec![id.clone()],
+                        last_active: Instant::now(),
+                    },
+                );
+                self.spawn_worker_supervisor(model, handle);
                 Ok(to_session_info(&self.storage().resolve(&id)?))
             }
             Err(e) => {
@@ -165,22 +227,44 @@ impl<E: Engine + 'static> Daemon<E> {
         }
     }
 
-    /// Watches a worker for unexpected exit and demotes the session to `Stopped` (never
-    /// `Failed` — a worker crash is not a session failure) once it does.
-    fn spawn_supervisor(self: &Arc<Self>, id: String, handle: Arc<AsyncMutex<E>>) {
+    /// Watches a worker for unexpected exit — demoting every session attached to it to
+    /// `Stopped` (never `Failed`: a worker crash is not a session failure) — and puts it
+    /// to sleep after `IDLE_SLEEP_AFTER` with no query against any of its sessions.
+    fn spawn_worker_supervisor(self: &Arc<Self>, model: String, handle: Arc<AsyncMutex<E>>) {
         let daemon = self.clone();
         tokio::spawn(async move {
             loop {
                 // Briefly locking to poll, rather than holding the lock across a
                 // blocking wait, is what lets `generate`/`health` still get the lock
-                // while a session is alive.
+                // while the worker is alive.
                 if handle.lock().await.try_wait_for_exit().is_some() {
                     break;
                 }
+                let idle = daemon
+                    .workers
+                    .lock()
+                    .await
+                    .get(&model)
+                    .map(|e| e.last_active.elapsed() >= IDLE_SLEEP_AFTER)
+                    .unwrap_or(false);
+                if idle {
+                    let mut engine = handle.lock().await;
+                    if !engine.is_sleeping().await {
+                        let _ = engine.sleep().await;
+                    }
+                }
                 tokio::time::sleep(SUPERVISOR_POLL_INTERVAL).await;
             }
-            daemon.workers.lock().await.remove(&id);
-            let _ = daemon.transition(&id, SessionState::Active, SessionState::Stopped, None);
+            let session_ids = daemon
+                .workers
+                .lock()
+                .await
+                .remove(&model)
+                .map(|e| e.session_ids)
+                .unwrap_or_default();
+            for id in session_ids {
+                let _ = daemon.transition(&id, SessionState::Active, SessionState::Stopped, None);
+            }
         });
     }
 
@@ -205,8 +289,9 @@ impl<E: Engine + 'static> Daemon<E> {
     }
 
     /// Resolves a session for querying and reserves it for exclusive use for the
-    /// duration of the request; a second concurrent query on the same session fails
-    /// fast rather than queuing.
+    /// duration of the request; a second concurrent query on the *same session* fails
+    /// fast rather than queuing (sessions sharing a worker can still run concurrently —
+    /// this lock is per-session, not per-worker).
     pub async fn begin_query(&self, identifier: &str) -> Result<RunningQuery<E>, CliError> {
         let row = self.storage().resolve(identifier)?;
         if row.state != SessionState::Active {
@@ -218,10 +303,14 @@ impl<E: Engine + 'static> Daemon<E> {
         let guard = self.locks.try_acquire(&row.id).ok_or_else(|| {
             CliError::InvalidState("operation already in progress for this session".to_string())
         })?;
-        let workers = self.workers.lock().await;
-        let engine = workers.get(&row.id).cloned().ok_or_else(|| {
+        let mut workers = self.workers.lock().await;
+        let entry = workers.get_mut(&row.model).ok_or_else(|| {
             CliError::InvalidState("worker is not running in this daemon".to_string())
         })?;
+        entry.last_active = Instant::now();
+        let engine = entry.engine.clone();
+        drop(workers);
+        wake_if_sleeping(&engine).await.map_err(map_engine_error)?;
         Ok(RunningQuery {
             session_id: row.id,
             engine,
@@ -234,6 +323,17 @@ impl<E: Engine + 'static> Daemon<E> {
             .storage()
             .set_token_count(session_id, token_count, &now_rfc3339())?)
     }
+}
+
+/// Wakes `engine` only if it's actually asleep — checking first (rather than always
+/// calling `wake_up`) keeps the common case (an already-awake worker) to one cheap
+/// `is_sleeping` round-trip instead of a wake request the engine has to no-op internally.
+async fn wake_if_sleeping<E: Engine>(engine: &Arc<AsyncMutex<E>>) -> Result<(), EngineError> {
+    let mut engine = engine.lock().await;
+    if engine.is_sleeping().await {
+        engine.wake_up().await?;
+    }
+    Ok(())
 }
 
 fn to_session_info(row: &SessionRow) -> SessionInfo {

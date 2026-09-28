@@ -71,6 +71,13 @@ pub trait Engine: Send {
         prompt: &str,
     ) -> impl Future<Output = Result<GenerationHandle, EngineError>> + Send;
     fn stop_model(&mut self) -> impl Future<Output = Result<(), EngineError>> + Send;
+    /// Offloads weights to host RAM and frees the GPU allocation without exiting the
+    /// process — much cheaper to undo than a cold start. A no-op is never assumed; the
+    /// caller checks `is_sleeping` rather than tracking sleep state itself, since the
+    /// engine is the only source of truth for it.
+    fn sleep(&mut self) -> impl Future<Output = Result<(), EngineError>> + Send;
+    fn wake_up(&mut self) -> impl Future<Output = Result<(), EngineError>> + Send;
+    fn is_sleeping(&self) -> impl Future<Output = bool> + Send;
     /// Non-blocking: `None` while the worker is still alive. Supervision polls this
     /// instead of awaiting exit while holding the engine's lock — generate/health need
     /// that same lock, and a blocking wait would starve them for the whole session.

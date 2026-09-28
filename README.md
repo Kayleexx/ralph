@@ -11,6 +11,12 @@ Your model process can die. Your inference session does not have to.
 - The daemon owns session lifecycle, SQLite-backed session metadata (with automatic
   schema migrations), and a vLLM process adapter (spawn, health-check, streaming
   generation via chat completions)
+- Sessions for the same model share one vLLM worker instead of each cold-starting their
+  own — a second `ralph run` for a model already in use attaches to the existing worker
+  in well under a second instead of the usual ~30s+ cold start. A worker with no query
+  against any of its sessions for 5 minutes is put to sleep (vLLM's own sleep mode:
+  weights offloaded to host RAM, GPU freed) and woken automatically, in well under a
+  second, on the next query
 - `ralph run [model] [--name name]` — start a model and create a session. With no
   model and a real terminal, shows a small interactive picker instead of failing
 - `ralph query <session> <prompt>` — one-shot/scriptable query, streamed, with safe
