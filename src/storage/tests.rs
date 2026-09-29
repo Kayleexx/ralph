@@ -159,6 +159,34 @@ fn reconciliation_demotes_stuck_starting_session() {
     assert_eq!(demoted, vec!["01AAA".to_string()]);
 }
 
+/// §16.15 "force SQLite busy contention": a writer that holds the file lock past
+/// another connection's `busy_timeout` must surface `StorageError::Busy` cleanly, never
+/// panic or silently drop the write — and once released, a retry succeeds normally.
+#[test]
+fn contended_write_surfaces_as_busy_not_a_panic_or_silent_loss() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("busy.db");
+    let holder = Storage::open(&path).unwrap();
+    holder.insert(&sample_row("01AAA", "demo")).unwrap();
+    holder.test_execute("BEGIN IMMEDIATE; UPDATE sessions SET state = 'active' WHERE id = '01AAA'");
+
+    let contender = Storage::open(&path).unwrap();
+    contender.test_execute("PRAGMA busy_timeout = 100");
+    let err = contender
+        .set_state("01AAA", SessionState::Active, None, "2026-01-01T00:01:00Z")
+        .unwrap_err();
+    assert!(matches!(err, StorageError::Busy));
+
+    holder.test_execute("COMMIT");
+    contender
+        .set_state("01AAA", SessionState::Active, None, "2026-01-01T00:02:00Z")
+        .unwrap();
+    assert_eq!(
+        contender.resolve("demo").unwrap().state,
+        SessionState::Active
+    );
+}
+
 #[test]
 fn malformed_database_is_a_corruption_error_and_is_preserved() {
     let dir = tempfile::tempdir().unwrap();

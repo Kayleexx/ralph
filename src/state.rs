@@ -248,6 +248,47 @@ mod tests {
         assert!(validate_transition(SessionState::Active, SessionState::Active).is_err());
     }
 
+    /// States a crash or cancellation can strand a session in mid-operation. `Recovering`
+    /// is deliberately not here: it's a stable, explicit-action-required parking state
+    /// (like `Paused`), not an in-flight one — `(Starting, Recovering)`/`(Active,
+    /// Recovering)` are legitimate crash landings, not ambiguity.
+    const IN_TRANSIT: &[SessionState] = &[
+        SessionState::Starting,
+        SessionState::Pausing,
+        SessionState::Resuming,
+        SessionState::Hibernating,
+        SessionState::Moving,
+    ];
+
+    /// Rollback-completeness audit (Phase 7 gate 1): an in-transit state a crash or
+    /// cancellation can leave a session in must always have a defined way out, or that
+    /// session is stuck forever with no operation able to touch it again.
+    #[test]
+    fn every_in_transit_state_has_at_least_one_outgoing_transition() {
+        for &from in IN_TRANSIT {
+            let has_exit = SessionState::ALL
+                .iter()
+                .any(|&to| validate_transition(from, to).is_ok());
+            assert!(has_exit, "{from} has no defined transition out of it");
+        }
+    }
+
+    /// An in-flight state must resolve to a stable state, never hand off directly to
+    /// another in-flight state — that would make "what actually happened" ambiguous
+    /// exactly where Invariant "interrupted operations leave ownership unambiguous"
+    /// matters most.
+    #[test]
+    fn no_transition_moves_directly_between_two_in_flight_states() {
+        for &from in IN_TRANSIT {
+            for &to in IN_TRANSIT {
+                assert!(
+                    validate_transition(from, to).is_err(),
+                    "{from} -> {to} must not be directly defined"
+                );
+            }
+        }
+    }
+
     #[test]
     fn display_and_parse_round_trip_for_every_variant() {
         for state in SessionState::ALL {

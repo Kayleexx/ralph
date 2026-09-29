@@ -22,8 +22,8 @@ impl<E: Engine + 'static> Daemon<E> {
     /// `Starting`/`Active` from a previous run is marked `Recovering` — never silently
     /// `Active` again — and left for an explicit `ralph recover` rather than an eager
     /// auto-restart of every previously-active session on daemon startup. A session
-    /// still `Moving` from a killed `ralph handoff`/`ralph drain` rolls back to `Paused`
-    /// instead (see `Storage::rollback_stuck_moves`): it never left this machine.
+    /// stuck `Moving`/`Pausing`/`Hibernating`/`Resuming` from a killed operation rolls
+    /// back to a stable landing state instead (see `Storage::rollback_stuck_transitions`).
     pub fn reconcile_on_startup(&self) -> Result<Vec<String>, StorageError> {
         crate::engine::vllm::ownership::reconcile(
             &self.sessions_root,
@@ -46,8 +46,52 @@ impl<E: Engine + 'static> Daemon<E> {
             SessionState::Recovering,
             &super::now_rfc3339(),
         )?;
-        self.storage().rollback_stuck_moves(&super::now_rfc3339())?;
+        self.storage()
+            .rollback_stuck_transitions(&super::now_rfc3339())?;
+        self.gc_orphaned_artifacts();
         Ok(demoted)
+    }
+
+    /// Removes on-disk leftovers no current daemon state ever cleans up on its own:
+    /// `/dev/shm` offload segments (`ownership::reconcile`, just above, has already
+    /// killed every leftover worker process this run, so any such segment is
+    /// unconditionally orphaned — killed workers no longer hold vLLM's own shm mapping),
+    /// staged `handoff-recv-*.ralph` files (a crash between write and the one-shot
+    /// `__handoff-recv` process's own cleanup), and session directories with no matching
+    /// row (only reachable via a crash mid-`import`, between `create_session_dir` and
+    /// the row `insert` that publishes it — see `portable::import`'s ordering comment).
+    fn gc_orphaned_artifacts(&self) {
+        if let Ok(entries) = std::fs::read_dir("/dev/shm") {
+            for entry in entries.flatten() {
+                if entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("vllm_offload_ralph-")
+                {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+
+        let known: std::collections::HashSet<String> = self
+            .storage()
+            .list()
+            .map(|rows| rows.into_iter().map(|r| r.id).collect())
+            .unwrap_or_default();
+        let Ok(entries) = std::fs::read_dir(&self.sessions_root) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if path.is_file() && name.starts_with("handoff-recv-") {
+                let _ = std::fs::remove_file(&path);
+            } else if path.is_dir() && !known.contains(name) {
+                let _ = std::fs::remove_dir_all(&path);
+            }
+        }
     }
 
     /// Attaches to a live worker for `model` (waking it if asleep), or cold-starts one,

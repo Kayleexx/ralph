@@ -1,16 +1,16 @@
-//! RALPH_E2E_VLLM=1 cargo test --test e2e_phase6 -- --ignored --test-threads=1
+//! RALPH_E2E_VLLM=1 cargo test --test e2e_handoff_drain -- --ignored --test-threads=1
 //!
 //! Real, unmocked vLLM — validates `ralph drain` (fully local, always runs) and
 //! `ralph handoff` (needs a real SSH destination) on top of the daemon-side plumbing
 //! already covered by unit tests in `src/daemon/tests_handoff.rs`/`tests_drain.rs`.
 //!
-//! Per RALPH_SPEC.md §14.3/§14.5, the handoff test targets a real SSH destination
-//! rather than trying to smuggle a distinct `XDG_DATA_HOME` through an unconfigured
-//! loopback SSH session (which most sshd installs won't pass through anyway) — set
-//! RALPH_E2E_HANDOFF_DEST to an "ssh"-reachable host with `ralph` on its PATH whose
-//! sshd accepts XDG_DATA_HOME (e.g. `AcceptEnv XDG_DATA_HOME` for a loopback test
-//! account), or a real second machine per §14.5. Unset, the handoff test skips
-//! cleanly — the same spirit as the multi-GPU tests skipping without a second GPU.
+//! The handoff test targets a real SSH destination rather than trying to smuggle a
+//! distinct `XDG_DATA_HOME` through an unconfigured loopback SSH session (which most
+//! sshd installs won't pass through anyway) — set RALPH_E2E_HANDOFF_DEST to an
+//! "ssh"-reachable host with `ralph` on its PATH whose sshd accepts XDG_DATA_HOME
+//! (e.g. `AcceptEnv XDG_DATA_HOME` for a loopback test account), or a real second
+//! machine. Unset, the handoff test skips cleanly — the same spirit as the multi-GPU
+//! tests skipping without a second GPU.
 mod support;
 use support::*;
 

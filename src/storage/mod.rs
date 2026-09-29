@@ -339,18 +339,30 @@ impl Storage {
         Ok(demoted)
     }
 
-    /// A daemon crash mid-`ralph handoff`/`ralph drain` can only ever leave a session
-    /// stuck in the transient `Moving` state — the commit into `Moved` is the very last
-    /// step of a handoff, so anything still `Moving` at startup never actually left this
-    /// machine. This daemon process starts with no in-memory worker handles either way,
-    /// so the honest landing state is always `Paused` (never `Moved`, never silently
-    /// `Active` again) — `ralph resume` picks fast vs. portable from there exactly like
-    /// any other paused session.
-    pub fn rollback_stuck_moves(&self, now: &str) -> Result<Vec<String>, StorageError> {
+    /// A daemon crash mid-operation can only ever leave a session in one of these
+    /// transient states — each is the very last thing to flip before a stable landing
+    /// state, and by the time this runs, `ownership::reconcile` has already killed any
+    /// worker process the previous daemon still had running, so which stable state we
+    /// land in is always safe regardless of exactly how far the interrupted operation
+    /// got (Phase 7 gate 1's rollback-completeness audit, `state.rs`'s in-transit test):
+    /// `Moving` (handoff/drain never actually left this machine until its final commit)
+    /// and `Resuming` both land in `Paused`; `Pausing`/`Hibernating` land in the state
+    /// they were already about to reach. This daemon process starts with no in-memory
+    /// worker handles either way, so nothing here is ever silently `Active` again —
+    /// `ralph resume` picks fast vs. portable from the landing state exactly like any
+    /// other paused/hibernated session.
+    pub fn rollback_stuck_transitions(&self, now: &str) -> Result<Vec<String>, StorageError> {
         let mut rolled_back = Vec::new();
         for row in self.list()? {
-            if row.state == SessionState::Moving {
-                self.set_state(&row.id, SessionState::Paused, None, now)?;
+            let landing = match row.state {
+                SessionState::Moving | SessionState::Resuming | SessionState::Pausing => {
+                    Some(SessionState::Paused)
+                }
+                SessionState::Hibernating => Some(SessionState::Hibernated),
+                _ => None,
+            };
+            if let Some(landing) = landing {
+                self.set_state(&row.id, landing, None, now)?;
                 rolled_back.push(row.id);
             }
         }

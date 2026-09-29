@@ -51,6 +51,78 @@ pub fn has_room(dir: &Path, needed_bytes: u64) -> bool {
         && fs2::available_space(dir).is_ok_and(|free| free >= needed_bytes)
 }
 
+const SIGNATURE_FILE: &str = ".ralph_kv_signature";
+
+/// (total bytes, newest mtime, file count) across every file anywhere under `dir`
+/// (recursive — vLLM's own `TieringOffloadingSpec` nests block files several
+/// directories deep, e.g. `<hash>_r0/32d/78_g0/*.bin`), except the signature file
+/// itself. A coarse fingerprint, not a cryptographic hash: good enough to detect the
+/// realistic corruption shapes (truncation, a swapped-in file, a partial write) §16.15
+/// "corrupt KV checkpoint" cares about, without reading gigabytes of KV content on
+/// every checkpoint/resume.
+fn content_fingerprint(dir: &Path) -> Option<(u64, u64, u64)> {
+    fn walk(dir: &Path, total: &mut u64, newest: &mut u64, count: &mut u64) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            if entry.file_name() == SIGNATURE_FILE {
+                continue;
+            }
+            let path = entry.path();
+            let Ok(meta) = entry.metadata() else { continue };
+            if meta.is_dir() {
+                walk(&path, total, newest, count);
+                continue;
+            }
+            if !meta.is_file() {
+                continue;
+            }
+            *total += meta.len();
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            *newest = (*newest).max(mtime);
+            *count += 1;
+        }
+    }
+    let (mut total, mut newest, mut count) = (0u64, 0u64, 0u64);
+    walk(dir, &mut total, &mut newest, &mut count);
+    if count == 0 {
+        return None;
+    }
+    Some((total, newest, count))
+}
+
+/// Called once the worker that owned this directory has actually stopped (content is
+/// only stable once nothing is still writing to it) — never from `ralph checkpoint`
+/// alone, whose worker stays running.
+pub fn record_content_signature(dir: &Path) {
+    if let Some((total, newest, count)) = content_fingerprint(dir) {
+        let _ = std::fs::write(
+            dir.join(SIGNATURE_FILE),
+            format!("{total}:{newest}:{count}"),
+        );
+    }
+}
+
+/// `true` unless a signature was previously recorded and the directory's content no
+/// longer matches it — the honest way to tell "never populated yet" (nothing recorded,
+/// not a contradiction) apart from "populated, then something changed it outside ralph's
+/// own write path" (recorded, and now different — never trust it).
+pub fn content_signature_intact(dir: &Path) -> bool {
+    let Ok(recorded) = std::fs::read_to_string(dir.join(SIGNATURE_FILE)) else {
+        return true;
+    };
+    match content_fingerprint(dir) {
+        Some((total, newest, count)) => recorded == format!("{total}:{newest}:{count}"),
+        None => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

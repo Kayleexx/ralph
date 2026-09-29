@@ -1,15 +1,15 @@
-//! RALPH_E2E_VLLM=1 cargo test --test e2e_phase4 -- --ignored --test-threads=1
+//! RALPH_E2E_VLLM=1 cargo test --test e2e_hibernate -- --ignored --test-threads=1
 //!
 //! Real, unmocked vLLM — validates `ralph hibernate` actually releases the GPU worker
 //! and that `ralph resume` restores it, on top of the daemon-side plumbing already
 //! covered by unit tests in `src/daemon/tests_lifecycle.rs`.
 //!
-//! The "RAM tier full -> fall through to NVMe" edge case (§16.7) is vLLM's own
+//! The "RAM tier full -> fall through to NVMe" edge case is vLLM's own
 //! `TieringOffloadingSpec` behavior, not Ralph's — it was validated during the real
-//! feasibility experiment behind Phase 3's `engine/vllm/kv_offload.rs` (cross-process KV
-//! reuse confirmed via `/metrics` after a SIGKILL). Re-simulating a host-memory-full
+//! feasibility experiment behind `engine/vllm/kv_offload.rs` (cross-process KV reuse
+//! confirmed via `/metrics` after a SIGKILL). Re-simulating a host-memory-full
 //! condition here would not exercise any Ralph code path, so it is not re-tested; this
-//! is a documentation note, not a fake success path (CLAUDE.md).
+//! is a documentation note, not a fake success path.
 mod support;
 use std::time::Duration;
 use support::*;

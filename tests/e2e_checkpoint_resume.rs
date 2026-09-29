@@ -1,4 +1,4 @@
-//! RALPH_E2E_VLLM=1 cargo test --test e2e_phase3 -- --ignored --test-threads=1
+//! RALPH_E2E_VLLM=1 cargo test --test e2e_checkpoint_resume -- --ignored --test-threads=1
 //!
 //! Real, unmocked vLLM — validates the fast (native KV) vs. portable resume decision
 //! against actual vLLM 0.30.0 behavior (`OffloadingConnector` + `TieringOffloadingSpec`),

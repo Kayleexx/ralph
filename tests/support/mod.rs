@@ -1,4 +1,4 @@
-// Shared across multiple integration-test binaries (e2e_vllm, e2e_phase3, ...), each of
+// Shared across multiple integration-test binaries (e2e_vllm, e2e_checkpoint_resume, ...), each of
 // which recompiles this module as its own crate and only calls the subset it needs — that
 // makes every helper "unused" in some binary's own compilation, not actually dead code.
 #![allow(dead_code)]

@@ -9,6 +9,11 @@ use std::path::{Component, Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+/// Compatibility promise: within a version, only additive, ignorable changes are
+/// allowed (a new optional manifest field an older reader can skip) — anything that
+/// changes what the checksum covers, removes/renames an existing field, or changes
+/// how an existing field is interpreted requires bumping this and rejecting older
+/// readers via `UnsupportedVersion` below, never silently reinterpreting old archives.
 pub const FORMAT_VERSION: u32 = 1;
 /// Generous headroom over the KV quota (`daemon::lifecycle::KV_QUOTA_BYTES`) a single
 /// session's checkpoint could plausibly hold — bounds how much a hostile or corrupt

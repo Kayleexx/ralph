@@ -1,7 +1,7 @@
 //! Command-line surface. Only run/query/ps/inspect/doctor/chat are registered — an
 //! unregistered subcommand produces clap's own honest "unrecognized subcommand" error
 //! rather than a hand-written "not implemented yet" message.
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(
@@ -135,6 +135,8 @@ pub enum Command {
     },
     /// Check the local environment (GPU, vLLM, disk, sqlite) — never mutates anything
     Doctor,
+    /// Print a shell completion script to stdout
+    Completions { shell: clap_complete::Shell },
     /// Internal: run the daemon loop in the foreground. Not part of the public surface.
     #[command(hide = true, name = "__daemon")]
     InternalDaemon,
@@ -157,6 +159,10 @@ pub struct Flags {
     pub quiet: bool,
     pub no_color: bool,
     pub verbose: bool,
+}
+
+pub fn print_completions(shell: clap_complete::Shell) {
+    clap_complete::generate(shell, &mut Cli::command(), "ralph", &mut std::io::stdout());
 }
 
 impl From<&Cli> for Flags {

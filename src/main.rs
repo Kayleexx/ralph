@@ -104,6 +104,10 @@ async fn dispatch(cli: Cli) -> i32 {
             commands::run_drain(&home, flags, location, to, yes).await
         }
         Command::Doctor => commands::run_doctor(&home, flags),
+        Command::Completions { shell } => {
+            cli::print_completions(shell);
+            0
+        }
         Command::InternalHandoffProbe => handoff_recv::run_probe(&home).await,
         Command::InternalHandoffRecv { name } => handoff_recv::run_recv(&home, name).await,
     }

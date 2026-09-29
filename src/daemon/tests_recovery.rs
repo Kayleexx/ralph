@@ -1,4 +1,5 @@
 use super::tests::*;
+use super::tests_engines::AlwaysFailingEngine;
 use super::*;
 use std::sync::atomic::Ordering;
 
@@ -242,6 +243,32 @@ async fn immediate_replacement_crashes_share_one_retry_budget() {
     assert_eq!(daemon.inspect("demo").unwrap().session.state, "stopped");
     assert_eq!(daemon.storage().restart_attempts("model").unwrap(), 3);
     assert!(daemon.workers.lock().await.is_empty());
+}
+
+/// Regression test for GC (§16.15 storage cleanup): a leftover `handoff-recv-*.ralph`
+/// staging file and a session directory whose row never made it to `insert` (the
+/// crash-mid-`import` window) are both orphans by the time a fresh daemon boots — the
+/// live session's own directory must survive the same sweep untouched.
+#[tokio::test]
+async fn reconcile_on_startup_sweeps_orphaned_handoff_recv_files_and_rowless_session_dirs() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = test_daemon(dir.path());
+    let info = daemon
+        .run("model".to_string(), Some("demo".to_string()))
+        .await
+        .unwrap();
+
+    let sessions_root = dir.path().join("sessions");
+    let stale_recv = sessions_root.join("handoff-recv-01ORPHAN.ralph");
+    std::fs::write(&stale_recv, b"partial").unwrap();
+    let rowless_dir = sessions_root.join("01ROWLESSORPHAN");
+    std::fs::create_dir_all(&rowless_dir).unwrap();
+
+    daemon.reconcile_on_startup().unwrap();
+
+    assert!(!stale_recv.exists());
+    assert!(!rowless_dir.exists());
+    assert!(sessions_root.join(&info.id).exists());
 }
 
 #[tokio::test]

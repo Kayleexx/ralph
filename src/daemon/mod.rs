@@ -18,6 +18,7 @@ use crate::state::{self, SessionState};
 use crate::storage::{SessionRow, Storage};
 
 mod admission;
+mod checkpoint;
 pub(crate) mod drain;
 pub(crate) mod handoff;
 mod idle;
@@ -31,7 +32,11 @@ pub(crate) mod tests;
 #[cfg(test)]
 mod tests_admission;
 #[cfg(test)]
+mod tests_checkpoint;
+#[cfg(test)]
 mod tests_drain;
+#[cfg(test)]
+mod tests_engines;
 #[cfg(test)]
 mod tests_handoff;
 #[cfg(test)]
@@ -97,6 +102,10 @@ pub struct Daemon<E: Engine + 'static> {
     /// The `ssh` executable `handoff::run_ssh` invokes — always `"ssh"` in production;
     /// tests point this at a fake script so handoff/drain tests never touch the network.
     ssh_program: SyncMutex<String>,
+    /// Forces `lifecycle::has_checkpoint_room` to report no space, for deterministic
+    /// disk-full tests (RALPH_SPEC.md §16.15 "fill checkpoint disk") without needing to
+    /// actually exhaust a filesystem. `false` (real check) in production.
+    force_disk_full: SyncMutex<bool>,
 }
 
 fn real_gpu_check() -> bool {
@@ -128,7 +137,16 @@ impl<E: Engine + 'static> Daemon<E> {
             gpu_memory: admission::gpu_memory,
             draining: SyncMutex::new(None),
             ssh_program: SyncMutex::new("ssh".to_string()),
+            force_disk_full: SyncMutex::new(false),
         })
+    }
+
+    #[cfg(test)]
+    pub fn set_disk_full(&self, full: bool) {
+        *self
+            .force_disk_full
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = full;
     }
 
     // Recovers the guard on poison rather than panicking — a panic in one caller while

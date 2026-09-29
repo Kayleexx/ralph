@@ -39,6 +39,8 @@ and committed conversation history across vLLM worker crashes and daemon restart
   `ralph inspect dem` suggests `demo`)
 - `ralph doctor` — check the local environment (GPU, vLLM, disk, SQLite), safe to run
   before anything else exists
+- `ralph completions <shell>` — print a completion script for bash/zsh/fish/elvish/
+  powershell to stdout
 
 ## Building
 
@@ -53,7 +55,15 @@ cargo install --path .
 ```
 
 This installs to `~/.cargo/bin/ralph` — make sure that directory is on your `PATH`.
-A running daemon keeps its current build; restart it to pick up a new install.
+**A running daemon keeps whatever build was in memory when it started; a fresh
+`cargo install`/`cargo build` only takes effect after that daemon is restarted**
+(`kill $(cat <data-dir>/ralph/daemon.pid)`, then any command auto-starts a new one).
+
+Shell completions:
+
+```bash
+ralph completions zsh > ~/.zsh/completions/_ralph     # or bash/fish/elvish/powershell
+```
 
 ## Running against real vLLM
 
@@ -96,6 +106,21 @@ directory hashing, which doesn't cover those fields. A missing, incompatible, or
 never-yet-populated checkpoint always falls back to a portable (full-replay) resume —
 `--fast-only` fails clearly instead of silently falling back.
 
+## Troubleshooting
+
+- **Start with `ralph doctor`** — checks GPU, vLLM, disk, and SQLite before anything
+  else, safe to run even before any session exists.
+- **A change you just built doesn't seem to be taking effect** — the daemon is still
+  running the old build; see the install-flow note above.
+- **`GPU OOM` / `cannot start ... safely` right after killing a worker** — the old
+  worker process may not have released VRAM yet; check
+  `nvidia-smi --query-compute-apps=pid,used_memory,process_name --format=csv,noheader`
+  for a process that no longer has a matching Ralph session (`ralph ps`) and kill it
+  directly.
+- **Terminal width / tiny-terminal wrapping**: not implemented — output isn't
+  responsive to terminal width today; use `--json` for scripting or a wide terminal
+  for the human-readable tables.
+
 ## Testing
 
 ```bash
@@ -109,10 +134,11 @@ a separate, manual check:
 
 ```bash
 RALPH_E2E_VLLM=1 cargo test --test e2e_vllm -- --ignored --test-threads=1
-RALPH_E2E_VLLM=1 cargo test --test e2e_phase3 -- --ignored --test-threads=1
-RALPH_E2E_VLLM=1 cargo test --test e2e_phase4 -- --ignored --test-threads=1
-RALPH_E2E_VLLM=1 cargo test --test e2e_phase5 -- --ignored --test-threads=1
-RALPH_E2E_VLLM=1 cargo test --test e2e_phase6 -- --ignored --test-threads=1
+RALPH_E2E_VLLM=1 cargo test --test e2e_checkpoint_resume -- --ignored --test-threads=1
+RALPH_E2E_VLLM=1 cargo test --test e2e_hibernate -- --ignored --test-threads=1
+RALPH_E2E_VLLM=1 cargo test --test e2e_export_import -- --ignored --test-threads=1
+RALPH_E2E_VLLM=1 cargo test --test e2e_handoff_drain -- --ignored --test-threads=1
+RALPH_E2E_VLLM=1 cargo test --test e2e_fault_injection -- --ignored --test-threads=1
 ```
 
 These use the locally built binary, isolated data roots, and small Qwen models: worker
@@ -120,5 +146,8 @@ crashes, daemon restarts during/after recovery, Ctrl-C/disconnect/cancellation,
 checkpoint/pause/resume/hibernate fast-vs-portable decisions, export/import round trips
 (with and without KV state, plus corrupted-artifact rejection), and drain. `handoff`'s
 own SSH round trip additionally needs `RALPH_E2E_HANDOFF_DEST` set to a reachable
-destination (see `tests/e2e_phase6.rs`) and skips cleanly without one, the same way the
-multi-GPU tests skip without a second GPU.
+destination (see `tests/e2e_handoff_drain.rs`) and skips cleanly without one, the same way
+the multi-GPU tests skip without a second GPU. `e2e_fault_injection` is the
+fault-injection suite: corrupted/removed KV checkpoints, a daemon killed mid-pause, and
+truncated durable history — disk-full and SQLite-busy handling are covered at unit
+level instead (`src/daemon/tests_checkpoint.rs`, `src/storage/tests.rs`).

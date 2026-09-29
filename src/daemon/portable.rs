@@ -112,6 +112,13 @@ impl<E: Engine + 'static> Daemon<E> {
         }
 
         let archive = self.build_export_archive(&row, with_accel)?;
+        let dest_dir = output_path.parent().filter(|p| !p.as_os_str().is_empty());
+        let dest_dir = dest_dir.unwrap_or_else(|| Path::new("."));
+        if !kv_offload::has_room(dest_dir, archive.len() as u64) {
+            return Err(CliError::Resource(
+                "not enough disk space to write the export archive; session is unaffected".into(),
+            ));
+        }
         write_archive_atomically(output_path, &archive, force)?;
         Ok(to_session_info(&row))
     }

@@ -149,6 +149,49 @@ fn doctor_never_mutates_the_data_directory_before_it_exists() {
     );
 }
 
+/// A confirmation-required operation must never block on an interactive prompt when
+/// run non-interactively (piped stdin/stdout, as this whole suite already runs) — it
+/// fails/no-ops with an instruction to pass the explicit flag instead. `drain --to`
+/// requires confirmation regardless of how many sessions are actually affected.
+#[test]
+fn drain_with_a_destination_is_a_no_op_without_yes_in_non_interactive_mode() {
+    let home = isolated_home();
+    let output = ralph(&home)
+        .args(["--json", "drain", "gpu0", "--to", "user@host"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let parsed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(parsed["executed"], false);
+}
+
+/// `--verbose`'s own contract ("show internal details ... never prompt content",
+/// `src/cli.rs`) must actually reveal something plain output omits — inserted
+/// directly via SQL since a real session needs a GPU-backed worker this suite
+/// deliberately avoids.
+#[test]
+fn verbose_ps_reveals_the_session_id_plain_output_omits() {
+    let home = isolated_home();
+    ralph(&home).args(["--json", "ps"]).output().unwrap(); // creates the data dir/db
+
+    let db_path = home.path().join("ralph").join("ralph.db");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute(
+        "INSERT INTO sessions (id, name, model, engine, state, location, token_count, created_at, updated_at)
+         VALUES ('01VERBOSETEST', 'verbose-demo', 'some/model', 'vllm', 'stopped', 'local/gpu0', 0, 't', 't')",
+        [],
+    )
+    .unwrap();
+
+    let plain = ralph(&home).arg("ps").output().unwrap();
+    let plain_stdout = String::from_utf8_lossy(&plain.stdout);
+    assert!(!plain_stdout.contains("01VERBOSETEST"));
+
+    let verbose = ralph(&home).args(["--verbose", "ps"]).output().unwrap();
+    let verbose_stdout = String::from_utf8_lossy(&verbose.stdout);
+    assert!(verbose_stdout.contains("01VERBOSETEST"));
+}
+
 // Sanity check that the binary under test actually exists and is executable directly,
 // independent of assert_cmd's own resolution, to fail fast with a clear message if the
 // build step that should have produced it didn't run.

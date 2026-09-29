@@ -4,6 +4,18 @@
 //! an on-disk `NOT NULL` violation, which got misreported as a duplicate session name.
 //! Every future schema change adds an entry to `MIGRATIONS` instead of relying on
 //! `CREATE TABLE IF NOT EXISTS` to somehow fix up existing rows.
+//!
+//! Compatibility promise: `PRAGMA user_version` only ever moves forward — there is no
+//! downgrade path, and a database opened by a newer build is never expected to work
+//! with an older one. An existing `MIGRATIONS` entry, once released, is never edited
+//! or reordered (that would silently change what "already migrated" means for a
+//! database that already ran it) — a later fix always adds a new entry instead. Every
+//! migration either creates a new table (`CREATE TABLE IF NOT EXISTS`-safe on its own)
+//! or explicitly rebuilds an existing one (`migrate_v1_nullable_model_revision`'s
+//! rename-recreate-copy-drop shape) or adds a column (`ALTER TABLE ... ADD COLUMN`,
+//! SQLite-atomic and never rewrites existing rows) — never a migration that could
+//! drop or truncate existing data if interrupted partway; each one runs inside its
+//! own transaction (`run`, below) for exactly that reason.
 use rusqlite::{Connection, OptionalExtension};
 
 use super::{SCHEMA, StorageError};

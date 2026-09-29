@@ -1,4 +1,4 @@
-//! RALPH_E2E_VLLM=1 cargo test --test e2e_phase5 -- --ignored --test-threads=1
+//! RALPH_E2E_VLLM=1 cargo test --test e2e_export_import -- --ignored --test-threads=1
 //!
 //! Real, unmocked vLLM — validates `ralph export`/`ralph import` actually reconstruct a
 //! usable session, on top of the daemon-side plumbing already covered by unit tests in
