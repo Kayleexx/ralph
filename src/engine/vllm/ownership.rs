@@ -17,6 +17,8 @@ pub(super) struct Ownership {
     pub endpoint: String,
     pub model: String,
     pub revision: Option<String>,
+    #[serde(default)]
+    pub profile: Option<crate::engine::profiles::WorkerProfile>,
 }
 
 fn identity(pid: u32) -> io::Result<(u32, String)> {
@@ -45,6 +47,7 @@ impl Ownership {
         endpoint: String,
         model: String,
         revision: Option<String>,
+        profile: Option<crate::engine::profiles::WorkerProfile>,
     ) -> io::Result<Self> {
         let (group, start) = identity(pid)?;
         if group != pid {
@@ -59,6 +62,7 @@ impl Ownership {
             endpoint,
             model,
             revision,
+            profile,
         })
     }
 
@@ -158,7 +162,7 @@ impl Ownership {
 
 pub(crate) fn reconcile(
     sessions: &Path,
-    valid: impl Fn(&str, &str, Option<&str>) -> bool,
+    valid: impl Fn(&str, &str, Option<&str>, Option<crate::engine::profiles::WorkerProfile>) -> bool,
 ) -> io::Result<()> {
     if !sessions.exists() {
         return Ok(());
@@ -174,7 +178,7 @@ pub(crate) fn reconcile(
             .and_then(|p| p.file_name())
             .and_then(|s| s.to_str())
             .ok_or_else(|| io::Error::other("invalid ownership directory"))?;
-        if !valid(id, &owned.model, owned.revision.as_deref())
+        if !valid(id, &owned.model, owned.revision.as_deref(), owned.profile)
             || !owned.endpoint.starts_with("http://127.0.0.1:")
         {
             return Err(io::Error::other(
@@ -203,6 +207,7 @@ mod tests {
             endpoint: "local".into(),
             model: "test".into(),
             revision: None,
+            profile: None,
         };
         assert!(record.cleanup().is_err());
     }
@@ -229,6 +234,7 @@ mod process_tests {
             "http://127.0.0.1:9000".into(),
             "test".into(),
             Some("rev".into()),
+            None,
         )
         .unwrap();
         let dir = tempfile::tempdir().unwrap();

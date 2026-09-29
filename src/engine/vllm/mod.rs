@@ -26,10 +26,7 @@ mod tests;
 mod tokenize;
 
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(500);
-// vLLM's cold start (import torch, init CUDA, spawn the EngineCore subprocess, load
-// weights) routinely takes 60-150s+ even for a sub-1B model on a modest single GPU —
-// 120s was cutting that close enough to fail on a healthy, still-loading worker. This is
-// a ceiling against a genuinely stuck process, not a tuned "typical" duration.
+// Cold imports, CUDA initialization and uncached weights can take several minutes.
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(300);
 // vLLM's own default (0.9) pre-allocates most of the GPU's memory up front, which fails
 // outright on a workstation where something else (a desktop compositor, browser, etc.) is
@@ -46,6 +43,7 @@ pub struct VllmEngine {
     model: String,
     child: Option<Child>,
     owned: Option<ownership::Ownership>,
+    profile: Option<super::profiles::WorkerProfile>,
 }
 
 impl VllmEngine {
@@ -57,6 +55,7 @@ impl VllmEngine {
             model: String::new(),
             child: None,
             owned: None,
+            profile: None,
         }
     }
 }
@@ -94,23 +93,40 @@ fn pick_free_port() -> Result<u16, EngineError> {
 }
 
 /// Split out for testability: the exact flags passed to `vllm serve`.
-fn vllm_serve_args(model: &str, port: u16, revision: Option<&str>) -> Vec<String> {
+fn vllm_serve_args(
+    model: &str,
+    port: u16,
+    revision: Option<&str>,
+    profile: Option<super::profiles::WorkerProfile>,
+) -> Vec<String> {
     let mut args = vec![
         "serve".to_string(),
         model.to_string(),
         "--port".to_string(),
         port.to_string(),
         "--gpu-memory-utilization".to_string(),
-        GPU_MEMORY_UTILIZATION.to_string(),
-        // Skips CUDA graph capture, which otherwise dominates startup time (tens of
-        // seconds even for a small model) — favors fast, repeatable session startup
-        // over the last bit of decode throughput.
+        if profile.is_some() {
+            "0.1"
+        } else {
+            GPU_MEMORY_UTILIZATION
+        }
+        .to_string(),
+        // Eager execution keeps startup and runtime allocation predictable.
         "--enforce-eager".to_string(),
-        // Lets a worker be put to sleep (weights offloaded to host RAM, GPU freed)
-        // instead of killed when idle, and woken again in well under a second — see
-        // `sleep`/`wake_up`/`is_sleeping` below.
+        // Preserve the existing idle sleep lifecycle.
         "--enable-sleep-mode".to_string(),
     ];
+    // Explicit KV bypasses automatic sizing; utilization still gates startup in vLLM.
+    if let Some(profile) = profile {
+        args.extend([
+            "--max-model-len".into(),
+            profile.max_context.to_string(),
+            "--kv-cache-memory-bytes".into(),
+            (u64::from(profile.kv_mib) << 20).to_string(),
+            "--dtype".into(),
+            "bfloat16".into(),
+        ]);
+    }
     if let Some(revision) = revision {
         args.push("--revision".to_string());
         args.push(revision.to_string());
@@ -125,6 +141,7 @@ impl Engine for VllmEngine {
         let port = pick_free_port()?;
         self.base_url = format!("http://127.0.0.1:{port}");
         self.model = spec.model.clone();
+        self.profile = spec.profile;
 
         let revision = match &spec.revision {
             Some(revision) => Some(revision.clone()),
@@ -143,7 +160,12 @@ impl Engine for VllmEngine {
         let stderr_log = stdout_log.try_clone()?;
 
         let mut cmd = Command::new(resolve_vllm_binary());
-        cmd.args(vllm_serve_args(&spec.model, port, revision.as_deref()));
+        cmd.args(vllm_serve_args(
+            &spec.model,
+            port,
+            revision.as_deref(),
+            spec.profile,
+        ));
         // FlashInfer's sampler JIT-compiles a CUDA kernel on first use, which needs the
         // full CUDA toolkit (nvcc) rather than just the driver — not something Ralph
         // should require on a workstation that only has the driver installed.
@@ -175,6 +197,7 @@ impl Engine for VllmEngine {
             self.base_url.clone(),
             self.model.clone(),
             revision.clone(),
+            spec.profile,
         )?);
         if let Some(owned) = &self.owned {
             owned.save(&self.log_path.with_file_name("worker.json"))?;

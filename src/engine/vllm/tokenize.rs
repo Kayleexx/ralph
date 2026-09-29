@@ -48,7 +48,9 @@ impl VllmEngine {
         }
         Ok(Tokenized {
             ids: tokens.tokens,
-            limit: tokens.max_model_len,
+            limit: self.profile.map_or(tokens.max_model_len, |p| {
+                p.max_context.min(tokens.max_model_len)
+            }),
         })
     }
     pub(super) async fn tokenize_chat(

@@ -1,4 +1,6 @@
 //! RALPH_E2E_VLLM=1 cargo test --test e2e_vllm -- --ignored --test-threads=1
+#[path = "support/multimodel.rs"]
+mod multimodel;
 mod support;
 use std::time::Duration;
 use support::*;
@@ -198,7 +200,7 @@ fn cancelled_recovery_and_bounded_startup_failure_preserve_sessions() {
     let conflicting = h.output(&[
         "--json",
         "run",
-        "Qwen/Qwen3-0.6B",
+        "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
         "--name",
         "conflicting-model",
     ]);

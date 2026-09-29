@@ -31,7 +31,10 @@ impl Engine for FakeEngine {
         Ok(ResolvedModel {
             // Deliberately distinct from `spec.model` — the real bug this guards against
             // was the revision silently defaulting to the model id itself.
-            revision: Some(format!("{}-fake-rev", spec.model)),
+            revision: spec
+                .revision
+                .clone()
+                .or_else(|| Some(format!("{}-fake-rev", spec.model))),
             engine_version: Some("fake".to_string()),
         })
     }

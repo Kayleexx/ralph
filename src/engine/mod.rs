@@ -3,6 +3,7 @@
 //! checkpoint and a session-object concept get added once something actually implements
 //! and calls them.
 pub mod hub;
+pub mod profiles;
 pub mod vllm;
 
 use std::future::Future;
@@ -39,6 +40,7 @@ pub enum EngineError {
 pub struct ModelSpec {
     pub model: String,
     pub revision: Option<String>,
+    pub profile: Option<profiles::WorkerProfile>,
 }
 
 #[derive(Debug, Clone)]

@@ -35,9 +35,10 @@ impl<E: Engine + 'static> Daemon<E> {
         })?;
         entry.last_active = Instant::now();
         let engine = entry.engine.clone();
+        let profile = entry.profile;
 
         drop(workers);
-        wake_if_sleeping(&engine).await.map_err(map_engine_error)?;
+        self.wake_worker(&engine, profile).await?;
 
         let mut messages = self.storage().replay_turns(&row.id)?;
         messages.push(ChatMessage {

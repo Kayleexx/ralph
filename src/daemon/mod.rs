@@ -17,11 +17,14 @@ use crate::session;
 use crate::state::{self, SessionState};
 use crate::storage::{SessionRow, Storage, StorageError};
 
+mod admission;
 mod query;
 mod recovery;
 mod restart;
 #[cfg(test)]
 pub(crate) mod tests;
+#[cfg(test)]
+mod tests_admission;
 #[cfg(test)]
 mod tests_recovery;
 
@@ -36,6 +39,7 @@ const IDLE_SLEEP_AFTER: Duration = Duration::from_secs(300);
 struct WorkerEntry<E: Engine> {
     engine: Arc<AsyncMutex<E>>,
     resolved: ResolvedModel,
+    profile: Option<crate::engine::profiles::WorkerProfile>,
     session_ids: Vec<String>,
     last_active: Instant,
 }
@@ -65,6 +69,7 @@ pub struct Daemon<E: Engine + 'static> {
     startup: AsyncMutex<()>,
     make_engine: fn(PathBuf) -> E,
     has_gpu: fn() -> bool,
+    gpu_memory: fn() -> Result<admission::GpuMemory, CliError>,
 }
 
 fn real_gpu_check() -> bool {
@@ -93,6 +98,7 @@ impl<E: Engine + 'static> Daemon<E> {
             startup: AsyncMutex::new(()),
             make_engine,
             has_gpu,
+            gpu_memory: admission::gpu_memory,
         })
     }
 
@@ -121,12 +127,21 @@ impl<E: Engine + 'static> Daemon<E> {
     /// `Active` again — and left for an explicit `ralph recover` rather than an eager
     /// auto-restart of every previously-active session on daemon startup.
     pub fn reconcile_on_startup(&self) -> Result<Vec<String>, StorageError> {
-        crate::engine::vllm::ownership::reconcile(&self.sessions_root, |id, model, revision| {
-            self.storage().resolve(id).is_ok_and(|row| {
-                row.model == model
-                    && (row.model_revision.is_none() || row.model_revision.as_deref() == revision)
-            })
-        })
+        crate::engine::vllm::ownership::reconcile(
+            &self.sessions_root,
+            |id, model, revision, profile| {
+                let row = { self.storage().resolve(id) };
+                row.is_ok_and(|row| {
+                    row.model == model
+                        && (row.model_revision.is_none()
+                            || row.model_revision.as_deref() == revision)
+                        && self
+                            .storage()
+                            .worker_profile(id)
+                            .is_ok_and(|saved| saved == profile)
+                })
+            },
+        )
         .map_err(|e| StorageError::Corrupt(format!("worker ownership: {e}")))?;
         self.storage().reconcile_after_restart(
             |_pid| false,
@@ -225,6 +240,17 @@ impl<E: Engine + 'static> Daemon<E> {
                     .map(|e| e.last_active.elapsed() >= IDLE_SLEEP_AFTER)
                     .unwrap_or(false);
                 if idle {
+                    let _startup = daemon.startup.lock().await;
+                    // Activity may have changed while another worker was starting.
+                    let still_idle = daemon
+                        .workers
+                        .lock()
+                        .await
+                        .get(&model)
+                        .is_some_and(|e| e.last_active.elapsed() >= IDLE_SLEEP_AFTER);
+                    if !still_idle {
+                        continue;
+                    }
                     let mut engine = handle.lock().await;
                     if !engine.is_sleeping().await
                         && let Err(error) = engine.sleep().await
@@ -286,17 +312,6 @@ impl<E: Engine + 'static> Daemon<E> {
             portable_state: if complete { "complete" } else { "incomplete" }.to_string(),
         })
     }
-}
-
-/// Wakes `engine` only if it's actually asleep — checking first (rather than always
-/// calling `wake_up`) keeps the common case (an already-awake worker) to one cheap
-/// `is_sleeping` round-trip instead of a wake request the engine has to no-op internally.
-async fn wake_if_sleeping<E: Engine>(engine: &Arc<AsyncMutex<E>>) -> Result<(), EngineError> {
-    let mut engine = engine.lock().await;
-    if engine.is_sleeping().await {
-        engine.wake_up().await?;
-    }
-    Ok(())
 }
 
 fn to_session_info(row: &SessionRow) -> SessionInfo {

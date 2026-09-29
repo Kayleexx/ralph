@@ -13,6 +13,7 @@ use crate::state::SessionState;
 use crate::typo::suggest_similar;
 
 mod migrate;
+mod profiles;
 mod restarts;
 #[cfg(test)]
 mod tests;

@@ -86,23 +86,34 @@ impl Harness {
         session
     }
     pub fn worker(&self) -> Option<Value> {
+        self.worker_for(MODEL)
+    }
+    pub fn worker_records(&self) -> Vec<Value> {
         let sessions = self.root().join("sessions");
         std::fs::read_dir(sessions)
-            .ok()?
+            .into_iter()
             .flatten()
-            .find_map(|entry| {
+            .flatten()
+            .filter_map(|entry| {
                 let bytes = std::fs::read(entry.path().join("worker.json")).ok()?;
                 serde_json::from_slice(&bytes).ok()
             })
+            .collect()
+    }
+    pub fn worker_for(&self, model: &str) -> Option<Value> {
+        self.worker_records()
+            .into_iter()
+            .find(|w| w["model"] == model)
     }
     pub fn remember_worker(&mut self) {
-        if let Some(worker) = self.worker()
-            && !self
+        for worker in self.worker_records() {
+            if !self
                 .workers
                 .iter()
                 .any(|old| old["nonce"] == worker["nonce"])
-        {
-            self.workers.push(worker);
+            {
+                self.workers.push(worker);
+            }
         }
     }
     pub fn kill_worker(&mut self) {
@@ -175,7 +186,7 @@ impl Harness {
     }
 }
 
-fn healthy(worker: &Value) -> bool {
+pub fn healthy(worker: &Value) -> bool {
     let Some(endpoint) = worker["endpoint"]
         .as_str()
         .and_then(|s| s.strip_prefix("http://"))
@@ -201,7 +212,7 @@ fn healthy(worker: &Value) -> bool {
         .is_ok_and(|n| String::from_utf8_lossy(&bytes[..n]).contains("200 OK"))
 }
 
-fn signal_owned(worker: &Value, send_signal: bool) {
+pub fn signal_owned(worker: &Value, send_signal: bool) {
     let Some(group) = worker["group"].as_u64() else {
         return;
     };

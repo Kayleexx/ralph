@@ -9,8 +9,8 @@ use std::time::Instant;
 use tokio::sync::Mutex as AsyncMutex;
 
 use super::restart::RestartPolicy;
-use super::{Daemon, WorkerEntry, map_engine_error, to_session_info, wake_if_sleeping};
-use crate::engine::{Engine, ModelSpec, ResolvedModel};
+use super::{Daemon, WorkerEntry, map_engine_error, to_session_info};
+use crate::engine::{Engine, ResolvedModel};
 use crate::error::CliError;
 use crate::ipc::SessionInfo;
 use crate::session;
@@ -34,17 +34,12 @@ impl<E: Engine + 'static> Daemon<E> {
         })?;
         let row = self.storage().resolve(session_id)?;
         let workers = self.workers.lock().await;
-        if workers.keys().any(|resident| resident != model) {
-            return Err(CliError::Resource(format!(
-                "cannot start {model}: another model is resident (including sleeping workers); session preserved, use the resident model"
-            )));
-        }
         let reuse = workers
             .get(model)
-            .map(|entry| (entry.engine.clone(), entry.resolved.clone()));
+            .map(|entry| (entry.engine.clone(), entry.resolved.clone(), entry.profile));
         drop(workers);
 
-        if let Some((engine_handle, resolved)) = reuse {
+        if let Some((engine_handle, resolved, profile)) = reuse {
             if row.model_revision.is_some() && row.model_revision != resolved.revision {
                 return Err(CliError::InvalidState(
                     "resident worker has a different model revision; history preserved".into(),
@@ -60,9 +55,8 @@ impl<E: Engine + 'static> Daemon<E> {
                     "worker exited; session preserved, retry after crash detection".into(),
                 ));
             }
-            wake_if_sleeping(&engine_handle)
-                .await
-                .map_err(map_engine_error)?;
+            self.share_profile(session_id, profile)?;
+            self.wake_reserved(&engine_handle, profile).await?;
             let pid = engine_handle.lock().await.pid().map(i64::from);
             let mut workers = self.workers.lock().await;
             let Some(entry) = workers.get_mut(model) else {
@@ -80,10 +74,7 @@ impl<E: Engine + 'static> Daemon<E> {
 
         let dir = session::session_dir(&self.sessions_root, session_id);
         let mut engine = (self.make_engine)(session::vllm_log_path(&dir));
-        let spec = ModelSpec {
-            model: model.to_string(),
-            revision: row.model_revision.clone(),
-        };
+        let spec = self.admitted_spec(&row).await?;
         let started = {
             let startup = engine.start_model(&spec);
             tokio::pin!(startup);
@@ -115,6 +106,7 @@ impl<E: Engine + 'static> Daemon<E> {
             WorkerEntry {
                 engine: handle.clone(),
                 resolved: resolved.clone(),
+                profile: spec.profile,
                 session_ids: vec![session_id.to_string()],
                 last_active: Instant::now(),
             },

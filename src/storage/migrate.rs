@@ -16,6 +16,7 @@ const MIGRATIONS: &[Migration] = &[
     migrate_v3_restarts,
     migrate_v4_tokens,
     migrate_v5_integrity,
+    migrate_v6_profiles,
 ];
 
 pub(crate) fn run(conn: &Connection) -> Result<(), StorageError> {
@@ -94,6 +95,13 @@ fn migrate_v4_tokens(conn: &Connection) -> Result<(), StorageError> {
 fn migrate_v5_integrity(conn: &Connection) -> Result<(), StorageError> {
     conn.execute_batch("ALTER TABLE token_turns ADD COLUMN checksum TEXT")?;
     super::token_log::seal_existing(conn)?;
+    Ok(())
+}
+
+fn migrate_v6_profiles(conn: &Connection) -> Result<(), StorageError> {
+    conn.execute_batch(
+        "CREATE TABLE session_profiles (session_id TEXT PRIMARY KEY, profile TEXT NOT NULL)",
+    )?;
     Ok(())
 }
 
