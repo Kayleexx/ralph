@@ -19,8 +19,14 @@ pub enum SessionState {
     Hibernated,
     /// Worker loss or an explicit recovery attempt.
     Recovering,
-    /// Reserved for handoff/drain; currently unreachable.
+    /// In transit during `ralph handoff`/`ralph drain`.
     Moving,
+    /// Handed off to another machine: durable history stays on disk (no surprise
+    /// destruction), but this session must never run here again without a fresh
+    /// explicit `ralph handoff`/import elsewhere — unlike `Stopped`, `ralph recover`
+    /// does not accept this state, so a moved session can never be resumed on two
+    /// machines at once.
+    Moved,
     Failed,
     Stopped,
 }
@@ -37,6 +43,7 @@ impl SessionState {
         SessionState::Hibernated,
         SessionState::Recovering,
         SessionState::Moving,
+        SessionState::Moved,
         SessionState::Failed,
         SessionState::Stopped,
     ];
@@ -53,6 +60,7 @@ impl SessionState {
             SessionState::Hibernated => "hibernated",
             SessionState::Recovering => "recovering",
             SessionState::Moving => "moving",
+            SessionState::Moved => "moved",
             SessionState::Failed => "failed",
             SessionState::Stopped => "stopped",
         }
@@ -134,6 +142,17 @@ pub fn validate_transition(from: SessionState, to: SessionState) -> Result<(), S
         (Hibernating, Active) => Ok(()),
         (Hibernated, Resuming) => Ok(()),
         (Resuming, Hibernated) => Ok(()),
+        // `ralph handoff`/`ralph drain`: any quiescent-or-active origin can enter
+        // transit. Commit lands in `Moved`; every other arm out of `Moving` is a
+        // rollback to whatever the session's true physical state turned out to be
+        // when the handoff failed (see `daemon::handoff::handoff_cancellable`).
+        (Active, Moving) => Ok(()),
+        (Paused, Moving) => Ok(()),
+        (Hibernated, Moving) => Ok(()),
+        (Moving, Moved) => Ok(()),
+        (Moving, Active) => Ok(()),
+        (Moving, Paused) => Ok(()),
+        (Moving, Hibernated) => Ok(()),
         (from, to) => Err(StateError { from, to }),
     }
 }
@@ -199,6 +218,29 @@ mod tests {
         assert!(validate_transition(SessionState::Hibernating, SessionState::Active).is_ok());
         assert!(validate_transition(SessionState::Hibernated, SessionState::Resuming).is_ok());
         assert!(validate_transition(SessionState::Resuming, SessionState::Hibernated).is_ok());
+    }
+
+    #[test]
+    fn handoff_transitions_succeed_from_every_quiescent_or_active_origin() {
+        assert!(validate_transition(SessionState::Active, SessionState::Moving).is_ok());
+        assert!(validate_transition(SessionState::Paused, SessionState::Moving).is_ok());
+        assert!(validate_transition(SessionState::Hibernated, SessionState::Moving).is_ok());
+        assert!(validate_transition(SessionState::Moving, SessionState::Moved).is_ok());
+    }
+
+    #[test]
+    fn handoff_rollback_lands_in_whichever_state_actually_holds() {
+        assert!(validate_transition(SessionState::Moving, SessionState::Active).is_ok());
+        assert!(validate_transition(SessionState::Moving, SessionState::Paused).is_ok());
+        assert!(validate_transition(SessionState::Moving, SessionState::Hibernated).is_ok());
+    }
+
+    #[test]
+    fn moved_is_terminal_and_unreachable_directly() {
+        assert!(validate_transition(SessionState::Active, SessionState::Moved).is_err());
+        assert!(validate_transition(SessionState::Moved, SessionState::Active).is_err());
+        assert!(validate_transition(SessionState::Moved, SessionState::Resuming).is_err());
+        assert!(validate_transition(SessionState::Moved, SessionState::Recovering).is_err());
     }
 
     #[test]

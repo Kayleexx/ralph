@@ -51,6 +51,7 @@ pub async fn run_daemon<E: Engine + 'static>(
         .reconcile_on_startup()
         .map_err(std::io::Error::other)?;
     daemon.spawn_idle_sweep();
+    spawn_sigterm_handler(daemon.clone());
 
     let listener = UnixListener::bind(&socket_path)?;
     loop {
@@ -60,6 +61,23 @@ pub async fn run_daemon<E: Engine + 'static>(
             let _ = handle_connection(daemon, stream).await;
         });
     }
+}
+
+/// Graceful preemption (RALPH_SPEC.md §6.11): on SIGTERM, one best-effort checkpoint
+/// pass over every active session, then exit — stopping the process is what "stop
+/// accepting new generation" means here, since every in-flight connection already
+/// handles a closed daemon socket the same safe way an ordinary crash does.
+fn spawn_sigterm_handler<E: Engine + 'static>(daemon: Arc<Daemon<E>>) {
+    tokio::spawn(async move {
+        let Ok(mut sigterm) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        else {
+            return;
+        };
+        sigterm.recv().await;
+        daemon.checkpoint_active_sessions_best_effort();
+        std::process::exit(0);
+    });
 }
 
 async fn handle_connection<E: Engine + 'static>(
@@ -155,6 +173,22 @@ async fn handle_connection<E: Engine + 'static>(
                 .await
                 .map(Response::Run);
             send_result(&mut stream, result).await
+        }
+        ipc::Request::Handoff {
+            session,
+            destination,
+            name,
+        } => {
+            lifecycle(&mut stream, Response::Run, |cancel| {
+                daemon.handoff_cancellable(&session, &destination, name, Some(cancel))
+            })
+            .await
+        }
+        ipc::Request::Drain { location, to, yes } => {
+            lifecycle(&mut stream, Response::Drain, |cancel| {
+                daemon.drain_cancellable(&location, to, yes, Some(cancel))
+            })
+            .await
         }
     }
 }

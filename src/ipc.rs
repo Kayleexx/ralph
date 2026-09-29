@@ -45,6 +45,16 @@ pub enum Request {
         path: String,
         name: Option<String>,
     },
+    Handoff {
+        session: String,
+        destination: String,
+        name: Option<String>,
+    },
+    Drain {
+        location: String,
+        to: Option<String>,
+        yes: bool,
+    },
 }
 
 /// Sent by the client in place of a new request while a `Query` is streaming, to cancel
@@ -81,6 +91,10 @@ pub struct InspectInfo {
     pub recoverability: String,
     pub fast_restore: String,
     pub portable_state: String,
+    /// `"user@gpu-box as research"` once `ralph handoff` has committed this session
+    /// elsewhere — `None` otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub moved_to: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -101,7 +115,26 @@ pub enum Response {
     Ps(Vec<SessionInfo>),
     Inspect(InspectInfo),
     Resume(ResumeInfo),
+    Drain(DrainReport),
     Error(ErrorPayload),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DrainOutcome {
+    pub name: String,
+    pub action: String,
+    pub ok: bool,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DrainReport {
+    pub location: String,
+    /// `false` while `ralph drain` is only printing its plan (no `--yes` yet, or more
+    /// than one session affected) — nothing has been touched.
+    pub executed: bool,
+    pub sessions: Vec<DrainOutcome>,
+    pub all_safe: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

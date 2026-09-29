@@ -105,6 +105,53 @@ pub async fn send_request(
     }
 }
 
+/// Like `send_request`, but wires the first Ctrl-C to a `Cancel` frame instead of
+/// killing the connection outright, and shows the same elapsed-time ticker
+/// `commands::send_with_progress` does — for the two ops long/network-bound enough to
+/// need both: `ralph handoff` and `ralph drain`.
+pub async fn send_cancellable_with_progress(
+    stream: &mut UnixStream,
+    request: &Request,
+    operation: &str,
+) -> std::io::Result<Response> {
+    let (mut reader, mut writer) = stream.split();
+    ipc::write_frame(&mut writer, request).await?;
+
+    let mut ticks = tokio::time::interval(Duration::from_secs(1));
+    ticks.tick().await; // first tick fires immediately; skip it
+    let start = std::time::Instant::now();
+    let mut printed = false;
+    let mut cancelled = false;
+    let mut ctrl_c = Box::pin(tokio::signal::ctrl_c());
+
+    loop {
+        tokio::select! {
+            biased;
+            frame = ipc::read_frame::<_, ServerMessage>(&mut reader) => {
+                match frame? {
+                    Some(ServerMessage::Result(boxed)) => {
+                        if printed {
+                            eprintln!();
+                        }
+                        return Ok(*boxed);
+                    }
+                    _ => return Err(std::io::Error::other("daemon sent an unexpected message")),
+                }
+            }
+            _ = ticks.tick() => {
+                eprint!("\r{operation}... {}s", start.elapsed().as_secs());
+                let _ = std::io::stderr().flush();
+                printed = true;
+            }
+            _ = &mut ctrl_c, if !cancelled => {
+                cancelled = true;
+                ipc::write_frame(&mut writer, &Cancel).await?;
+                eprintln!("\n^C cancelling...");
+            }
+        }
+    }
+}
+
 pub struct QueryOutcome {
     pub text: String,
     pub token_count: i64,

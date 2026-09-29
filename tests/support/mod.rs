@@ -244,6 +244,25 @@ impl Harness {
     pub fn query_named(&self, name: &str, prompt: &str) -> Value {
         self.json(&["query", name, prompt])
     }
+    pub fn handoff_json(&self, destination: &str, name: Option<&str>) -> Output {
+        let mut args = vec!["--json", "handoff", SESSION, destination];
+        if let Some(name) = name {
+            args.push("--name");
+            args.push(name);
+        }
+        self.command().args(&args).output().unwrap()
+    }
+    pub fn drain(&self, location: &str, to: Option<&str>, yes: bool) -> Value {
+        let mut args = vec!["--json", "drain", location];
+        if let Some(to) = to {
+            args.push("--to");
+            args.push(to);
+        }
+        if yes {
+            args.push("--yes");
+        }
+        self.json(&args)
+    }
     pub fn spawn_query(&self, prompt: &str) -> Child {
         self.command()
             .args(["query", SESSION, prompt])

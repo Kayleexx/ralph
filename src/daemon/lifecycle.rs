@@ -62,7 +62,7 @@ impl<E: Engine + 'static> Daemon<E> {
         }
     }
 
-    fn checkpoint_row_for(&self, row: &SessionRow) -> CheckpointRow {
+    pub(super) fn checkpoint_row_for(&self, row: &SessionRow) -> CheckpointRow {
         let dir = session::kvcache_dir(&session::session_dir(&self.sessions_root, &row.id));
         CheckpointRow {
             session_id: row.id.clone(),
@@ -133,6 +133,29 @@ impl<E: Engine + 'static> Daemon<E> {
         }
     }
 
+    /// Graceful SIGTERM preemption (RALPH_SPEC.md §6.11): one best-effort checkpoint
+    /// pass over every currently `Active` session before this process exits. Durable
+    /// token history is already flushed continuously (Phase 2), so this only improves
+    /// the odds of a *fast* resume elsewhere/after restart — the actual recovery path
+    /// is the existing `reconcile_on_startup` → `ralph recover`/`ralph resume` story,
+    /// unchanged. Never blocks on a fresh worker admission or state transition.
+    pub(crate) fn checkpoint_active_sessions_best_effort(&self) {
+        let Ok(rows) = self.storage().list() else {
+            return;
+        };
+        for row in rows {
+            if row.state != SessionState::Active {
+                continue;
+            }
+            if let Err(error) = self
+                .storage()
+                .upsert_checkpoint(&self.checkpoint_row_for(&row))
+            {
+                eprintln!("SIGTERM checkpoint failed for {}: {error}", row.name);
+            }
+        }
+    }
+
     pub async fn checkpoint(self: &Arc<Self>, identifier: &str) -> Result<SessionInfo, CliError> {
         let row = self.storage().resolve(identifier)?;
         let _guard = self.locks.try_acquire(&row.id).ok_or_else(|| {
@@ -156,7 +179,7 @@ impl<E: Engine + 'static> Daemon<E> {
     /// Shared by `pause_cancellable` and `hibernate_cancellable`: both release the GPU
     /// worker identically, differing only in what happens to the checkpoint pointer and
     /// which terminal state they land in.
-    async fn release_worker(&self, row: &SessionRow) -> Result<(), CliError> {
+    pub(super) async fn release_worker(&self, row: &SessionRow) -> Result<(), CliError> {
         let stop_engine = {
             let mut workers = self.workers.lock().await;
             match workers.get_mut(&row.model) {

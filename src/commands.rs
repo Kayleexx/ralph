@@ -1,6 +1,7 @@
 //! CLI command handlers: connects to the daemon (or runs checks directly, for `doctor`),
 //! sends the request, and renders the human/JSON/quiet output for each command.
 mod generation;
+mod handoff;
 mod lifecycle;
 mod portable;
 use std::io::{IsTerminal, Read, Write};
@@ -238,6 +239,7 @@ pub async fn run_run(home: &Path, cli: Flags, model: Option<String>, name: Optio
 }
 
 pub use generation::{run_query, run_recover};
+pub use handoff::{run_drain, run_handoff};
 pub use lifecycle::{run_checkpoint, run_hibernate, run_pause, run_resume};
 pub use portable::{run_export, run_import};
 
@@ -313,6 +315,9 @@ pub async fn run_inspect(home: &Path, cli: Flags, session: String) -> i32 {
                 println!("  recoverability: {}", info.recoverability);
                 println!("  fast restore: {}", info.fast_restore);
                 println!("  portable state: {}", info.portable_state);
+                if let Some(destination) = info.moved_to {
+                    println!("  moved to: {destination}");
+                }
                 if let Some(failure) = info.last_failure {
                     println!("  last worker failure: {failure}");
                 }

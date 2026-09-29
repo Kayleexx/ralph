@@ -27,6 +27,13 @@ and committed conversation history across vLLM worker crashes and daemon restart
   <path.ralph> [--name name]` — a session's durable history (and optionally its KV
   checkpoint) as a portable, checksummed `.ralph` archive; import lands paused and
   resumes fast on a matching machine, portable otherwise
+- `ralph handoff <session> <user@host> [--name name]` — move a session to another Ralph
+  installation over SSH; the source stays authoritative until the destination ACKs the
+  import, so a dropped connection or rejected transfer never leaves both machines
+  thinking they own it
+- `ralph drain <location> [--to user@host] [--yes]` — empty one GPU (`gpu0`): hand its
+  active sessions to a destination, or hibernate them in place with no destination.
+  Prints a plan first; `--yes` executes it
 - `ralph chat <session>` — interactive back-and-forth with a session
 - `ralph ps` / `ralph inspect <session>` — list and inspect sessions (typo-tolerant:
   `ralph inspect dem` suggests `demo`)
@@ -72,6 +79,8 @@ ralph --json inspect demo
 ralph recover demo                                    # after worker loss
 ralph hibernate demo && ralph resume demo              # release/reattach the GPU worker
 ralph export demo --with-accel && ralph import demo.ralph --name demo-copy
+ralph drain gpu0                                      # hibernates every active session
+ralph handoff demo user@gpu-box                       # move it to another installation
 ```
 
 Ctrl-C during `query`/`chat` cancels that one generation without touching the session.
@@ -103,9 +112,13 @@ RALPH_E2E_VLLM=1 cargo test --test e2e_vllm -- --ignored --test-threads=1
 RALPH_E2E_VLLM=1 cargo test --test e2e_phase3 -- --ignored --test-threads=1
 RALPH_E2E_VLLM=1 cargo test --test e2e_phase4 -- --ignored --test-threads=1
 RALPH_E2E_VLLM=1 cargo test --test e2e_phase5 -- --ignored --test-threads=1
+RALPH_E2E_VLLM=1 cargo test --test e2e_phase6 -- --ignored --test-threads=1
 ```
 
 These use the locally built binary, isolated data roots, and small Qwen models: worker
 crashes, daemon restarts during/after recovery, Ctrl-C/disconnect/cancellation,
-checkpoint/pause/resume/hibernate fast-vs-portable decisions, and export/import round
-trips (with and without KV state, plus corrupted-artifact rejection).
+checkpoint/pause/resume/hibernate fast-vs-portable decisions, export/import round trips
+(with and without KV state, plus corrupted-artifact rejection), and drain. `handoff`'s
+own SSH round trip additionally needs `RALPH_E2E_HANDOFF_DEST` set to a reachable
+destination (see `tests/e2e_phase6.rs`) and skips cleanly without one, the same way the
+multi-GPU tests skip without a second GPU.

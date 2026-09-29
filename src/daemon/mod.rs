@@ -15,9 +15,11 @@ use crate::ipc::{InspectInfo, SessionInfo};
 use crate::lock::SessionLocks;
 use crate::session;
 use crate::state::{self, SessionState};
-use crate::storage::{SessionRow, Storage, StorageError};
+use crate::storage::{SessionRow, Storage};
 
 mod admission;
+pub(crate) mod drain;
+pub(crate) mod handoff;
 mod idle;
 pub(crate) mod lifecycle;
 mod portable;
@@ -29,11 +31,17 @@ pub(crate) mod tests;
 #[cfg(test)]
 mod tests_admission;
 #[cfg(test)]
+mod tests_drain;
+#[cfg(test)]
+mod tests_handoff;
+#[cfg(test)]
 mod tests_lifecycle;
 #[cfg(test)]
 mod tests_portable;
 #[cfg(test)]
 mod tests_recovery;
+#[cfg(test)]
+mod tests_ssh_support;
 
 const SUPERVISOR_POLL_INTERVAL: Duration = Duration::from_millis(500);
 // How long a worker can go with no query against any of its sessions before it's put to
@@ -81,6 +89,14 @@ pub struct Daemon<E: Engine + 'static> {
     make_engine: fn(PathBuf) -> E,
     has_gpu: fn() -> bool,
     gpu_memory: fn() -> Result<admission::GpuMemory, CliError>,
+    /// Set for the duration of one `ralph drain` call, naming the location being
+    /// drained — this codebase is single-GPU only, so any drain blocks every new
+    /// admission system-wide until it returns (`drain::drain_cancellable`,
+    /// `recovery::attach_or_start_worker`'s admission check).
+    draining: SyncMutex<Option<String>>,
+    /// The `ssh` executable `handoff::run_ssh` invokes — always `"ssh"` in production;
+    /// tests point this at a fake script so handoff/drain tests never touch the network.
+    ssh_program: SyncMutex<String>,
 }
 
 fn real_gpu_check() -> bool {
@@ -110,6 +126,8 @@ impl<E: Engine + 'static> Daemon<E> {
             make_engine,
             has_gpu,
             gpu_memory: admission::gpu_memory,
+            draining: SyncMutex::new(None),
+            ssh_program: SyncMutex::new("ssh".to_string()),
         })
     }
 
@@ -131,34 +149,6 @@ impl<E: Engine + 'static> Daemon<E> {
         state::validate_transition(from, to)?;
         self.storage().set_state(id, to, pid, &now_rfc3339())?;
         Ok(())
-    }
-
-    /// This daemon process starts with no in-memory worker handles, so any session left
-    /// `Starting`/`Active` from a previous run is marked `Recovering` — never silently
-    /// `Active` again — and left for an explicit `ralph recover` rather than an eager
-    /// auto-restart of every previously-active session on daemon startup.
-    pub fn reconcile_on_startup(&self) -> Result<Vec<String>, StorageError> {
-        crate::engine::vllm::ownership::reconcile(
-            &self.sessions_root,
-            |id, model, revision, profile| {
-                let row = { self.storage().resolve(id) };
-                row.is_ok_and(|row| {
-                    row.model == model
-                        && (row.model_revision.is_none()
-                            || row.model_revision.as_deref() == revision)
-                        && self
-                            .storage()
-                            .worker_profile(id)
-                            .is_ok_and(|saved| saved == profile)
-                })
-            },
-        )
-        .map_err(|e| StorageError::Corrupt(format!("worker ownership: {e}")))?;
-        self.storage().reconcile_after_restart(
-            |_pid| false,
-            SessionState::Recovering,
-            &now_rfc3339(),
-        )
     }
 
     #[cfg(test)]
@@ -321,12 +311,17 @@ impl<E: Engine + 'static> Daemon<E> {
         } else {
             "unavailable"
         };
+        let moved_to = self
+            .storage()
+            .get_handoff(&row.id)?
+            .map(|h| format!("{} as {}", h.destination, h.remote_name));
         Ok(InspectInfo {
             session: to_session_info(&row),
             recoverability: if complete { recoverability } else { "degraded" }.to_string(),
             fast_restore: fast_restore.to_string(),
             last_failure: self.storage().last_worker_failure(&row.model)?,
             portable_state: if complete { "complete" } else { "incomplete" }.to_string(),
+            moved_to,
         })
     }
 }

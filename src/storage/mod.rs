@@ -13,6 +13,7 @@ use crate::state::SessionState;
 use crate::typo::suggest_similar;
 
 pub mod checkpoints;
+pub mod handoff;
 mod migrate;
 mod profiles;
 mod restarts;
@@ -336,6 +337,24 @@ impl Storage {
             }
         }
         Ok(demoted)
+    }
+
+    /// A daemon crash mid-`ralph handoff`/`ralph drain` can only ever leave a session
+    /// stuck in the transient `Moving` state — the commit into `Moved` is the very last
+    /// step of a handoff, so anything still `Moving` at startup never actually left this
+    /// machine. This daemon process starts with no in-memory worker handles either way,
+    /// so the honest landing state is always `Paused` (never `Moved`, never silently
+    /// `Active` again) — `ralph resume` picks fast vs. portable from there exactly like
+    /// any other paused session.
+    pub fn rollback_stuck_moves(&self, now: &str) -> Result<Vec<String>, StorageError> {
+        let mut rolled_back = Vec::new();
+        for row in self.list()? {
+            if row.state == SessionState::Moving {
+                self.set_state(&row.id, SessionState::Paused, None, now)?;
+                rolled_back.push(row.id);
+            }
+        }
+        Ok(rolled_back)
     }
 }
 

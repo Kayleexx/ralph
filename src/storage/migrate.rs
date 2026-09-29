@@ -18,6 +18,7 @@ const MIGRATIONS: &[Migration] = &[
     migrate_v5_integrity,
     migrate_v6_profiles,
     migrate_v7_checkpoints,
+    migrate_v8_handoffs,
 ];
 
 pub(crate) fn run(conn: &Connection) -> Result<(), StorageError> {
@@ -108,6 +109,11 @@ fn migrate_v6_profiles(conn: &Connection) -> Result<(), StorageError> {
 
 fn migrate_v7_checkpoints(conn: &Connection) -> Result<(), StorageError> {
     conn.execute_batch(super::checkpoints::SCHEMA)?;
+    Ok(())
+}
+
+fn migrate_v8_handoffs(conn: &Connection) -> Result<(), StorageError> {
+    conn.execute_batch(super::handoff::SCHEMA)?;
     Ok(())
 }
 

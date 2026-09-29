@@ -9,6 +9,7 @@ mod daemon;
 mod doctor;
 mod engine;
 mod error;
+mod handoff_recv;
 mod ipc;
 mod lock;
 mod picker;
@@ -94,6 +95,16 @@ async fn dispatch(cli: Cli) -> i32 {
             with_accel,
         } => commands::run_export(&home, flags, session, output, force, with_accel).await,
         Command::Import { path, name } => commands::run_import(&home, flags, path, name).await,
+        Command::Handoff {
+            session,
+            destination,
+            name,
+        } => commands::run_handoff(&home, flags, session, destination, name).await,
+        Command::Drain { location, to, yes } => {
+            commands::run_drain(&home, flags, location, to, yes).await
+        }
         Command::Doctor => commands::run_doctor(&home, flags),
+        Command::InternalHandoffProbe => handoff_recv::run_probe(&home).await,
+        Command::InternalHandoffRecv { name } => handoff_recv::run_recv(&home, name).await,
     }
 }

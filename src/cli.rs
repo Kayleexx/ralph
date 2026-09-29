@@ -112,11 +112,41 @@ pub enum Command {
         #[arg(long)]
         name: Option<String>,
     },
+    /// Move a session to another Ralph installation over SSH
+    Handoff {
+        /// Session name, id, or a unique id prefix.
+        session: String,
+        /// SSH destination, e.g. user@gpu-box.
+        destination: String,
+        /// Session name on the destination. Defaults to this session's own name.
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Safely empty one location (this daemon manages a single GPU: `gpu0`)
+    Drain {
+        /// The location to drain, e.g. gpu0.
+        location: String,
+        /// Hand active sessions off to this SSH destination instead of hibernating them.
+        #[arg(long)]
+        to: Option<String>,
+        /// Execute the plan instead of only printing it.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Check the local environment (GPU, vLLM, disk, sqlite) — never mutates anything
     Doctor,
     /// Internal: run the daemon loop in the foreground. Not part of the public surface.
     #[command(hide = true, name = "__daemon")]
     InternalDaemon,
+    /// Internal: report this machine's handoff capability to an SSH caller.
+    #[command(hide = true, name = "__handoff-probe")]
+    InternalHandoffProbe,
+    /// Internal: receive a `.ralph` archive over stdin and import it.
+    #[command(hide = true, name = "__handoff-recv")]
+    InternalHandoffRecv {
+        #[arg(long)]
+        name: Option<String>,
+    },
 }
 
 /// The subset of `Cli` the render/dispatch helpers need, split out so matching on

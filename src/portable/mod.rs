@@ -12,8 +12,10 @@ use thiserror::Error;
 pub const FORMAT_VERSION: u32 = 1;
 /// Generous headroom over the KV quota (`daemon::lifecycle::KV_QUOTA_BYTES`) a single
 /// session's checkpoint could plausibly hold — bounds how much a hostile or corrupt
-/// archive can make an import read/write before being rejected.
-const MAX_ARCHIVE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+/// archive can make an import read/write before being rejected. `pub(crate)` so
+/// `__handoff-recv` can cap how many bytes it reads from an SSH stdin pipe before this
+/// module ever gets to look at them.
+pub(crate) const MAX_ARCHIVE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
 const MANIFEST_ENTRY: &str = "manifest.json";
 const TURNS_ENTRY: &str = "turns.json";

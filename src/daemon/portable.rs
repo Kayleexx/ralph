@@ -34,26 +34,14 @@ struct ExportedCheckpoint {
 }
 
 impl<E: Engine + 'static> Daemon<E> {
-    pub async fn export(
+    /// Assembles the `.ralph` archive bytes for an already-resolved, already-locked
+    /// session — the one place archive bytes get built, shared by `export()` (writes
+    /// them to a local file) and `handoff_cancellable()` (streams them over `ssh`).
+    pub(super) fn build_export_archive(
         &self,
-        identifier: &str,
-        output_path: &Path,
-        force: bool,
+        row: &SessionRow,
         with_accel: bool,
-    ) -> Result<SessionInfo, CliError> {
-        let row = self.storage().resolve(identifier)?;
-        let _guard = self.locks.try_acquire(&row.id).ok_or_else(|| {
-            CliError::InvalidState("operation already in progress for this session".into())
-        })?;
-        let row = self.storage().resolve(&row.id)?;
-
-        if output_path.exists() && !force {
-            return Err(CliError::Usage(format!(
-                "{} already exists; use --force to overwrite",
-                output_path.display()
-            )));
-        }
-
+    ) -> Result<Vec<u8>, CliError> {
         let turns = self.storage().export_turns(&row.id)?;
         let turns_json = serde_json::to_vec(&turns).map_err(|e| CliError::Other(e.into()))?;
 
@@ -94,14 +82,36 @@ impl<E: Engine + 'static> Daemon<E> {
             created_at: row.created_at.clone(),
             exported_at: now_rfc3339(),
         };
-        let archive = portable::build_archive(
+        portable::build_archive(
             fields,
             &turns_json,
             checkpoint_json.as_deref(),
             kvcache_dir.as_deref(),
         )
-        .map_err(|e| CliError::Other(e.into()))?;
+        .map_err(|e| CliError::Other(e.into()))
+    }
 
+    pub async fn export(
+        &self,
+        identifier: &str,
+        output_path: &Path,
+        force: bool,
+        with_accel: bool,
+    ) -> Result<SessionInfo, CliError> {
+        let row = self.storage().resolve(identifier)?;
+        let _guard = self.locks.try_acquire(&row.id).ok_or_else(|| {
+            CliError::InvalidState("operation already in progress for this session".into())
+        })?;
+        let row = self.storage().resolve(&row.id)?;
+
+        if output_path.exists() && !force {
+            return Err(CliError::Usage(format!(
+                "{} already exists; use --force to overwrite",
+                output_path.display()
+            )));
+        }
+
+        let archive = self.build_export_archive(&row, with_accel)?;
         write_archive_atomically(output_path, &archive, force)?;
         Ok(to_session_info(&row))
     }

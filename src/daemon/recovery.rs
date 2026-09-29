@@ -15,8 +15,41 @@ use crate::error::CliError;
 use crate::ipc::SessionInfo;
 use crate::session;
 use crate::state::SessionState;
+use crate::storage::StorageError;
 
 impl<E: Engine + 'static> Daemon<E> {
+    /// This daemon process starts with no in-memory worker handles, so any session left
+    /// `Starting`/`Active` from a previous run is marked `Recovering` — never silently
+    /// `Active` again — and left for an explicit `ralph recover` rather than an eager
+    /// auto-restart of every previously-active session on daemon startup. A session
+    /// still `Moving` from a killed `ralph handoff`/`ralph drain` rolls back to `Paused`
+    /// instead (see `Storage::rollback_stuck_moves`): it never left this machine.
+    pub fn reconcile_on_startup(&self) -> Result<Vec<String>, StorageError> {
+        crate::engine::vllm::ownership::reconcile(
+            &self.sessions_root,
+            |id, model, revision, profile| {
+                let row = { self.storage().resolve(id) };
+                row.is_ok_and(|row| {
+                    row.model == model
+                        && (row.model_revision.is_none()
+                            || row.model_revision.as_deref() == revision)
+                        && self
+                            .storage()
+                            .worker_profile(id)
+                            .is_ok_and(|saved| saved == profile)
+                })
+            },
+        )
+        .map_err(|e| StorageError::Corrupt(format!("worker ownership: {e}")))?;
+        let demoted = self.storage().reconcile_after_restart(
+            |_pid| false,
+            SessionState::Recovering,
+            &super::now_rfc3339(),
+        )?;
+        self.storage().rollback_stuck_moves(&super::now_rfc3339())?;
+        Ok(demoted)
+    }
+
     /// Attaches to a live worker for `model` (waking it if asleep), or cold-starts one,
     /// logging to `session_id`'s directory if a cold start is needed. Shared by `run()`
     /// and `recover()` — recovery reuses this same attach path rather than a new one.
@@ -27,6 +60,11 @@ impl<E: Engine + 'static> Daemon<E> {
         cancel: &mut Option<tokio::sync::oneshot::Receiver<()>>,
         allow_native: bool,
     ) -> Result<(Arc<AsyncMutex<E>>, ResolvedModel, Option<i64>), CliError> {
+        if self.is_draining() {
+            return Err(CliError::Resource(
+                "this location is draining; new sessions are not being admitted, retry after the drain completes".into(),
+            ));
+        }
         // This guard reserves startup; registry locks are released before I/O.
         let _startup = self.startup.try_lock().map_err(|_| {
             CliError::Resource(
