@@ -12,6 +12,7 @@ mod error;
 mod ipc;
 mod lock;
 mod picker;
+mod portable;
 mod server;
 mod session;
 mod state;
@@ -86,6 +87,13 @@ async fn dispatch(cli: Cli) -> i32 {
             fast_only,
             portable,
         } => commands::run_resume(&home, flags, session, fast_only, portable).await,
+        Command::Export {
+            session,
+            output,
+            force,
+            with_accel,
+        } => commands::run_export(&home, flags, session, output, force, with_accel).await,
+        Command::Import { path, name } => commands::run_import(&home, flags, path, name).await,
         Command::Doctor => commands::run_doctor(&home, flags),
     }
 }

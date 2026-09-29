@@ -20,6 +20,7 @@ use crate::storage::{SessionRow, Storage, StorageError};
 mod admission;
 mod idle;
 pub(crate) mod lifecycle;
+mod portable;
 mod query;
 mod recovery;
 mod restart;
@@ -29,6 +30,8 @@ pub(crate) mod tests;
 mod tests_admission;
 #[cfg(test)]
 mod tests_lifecycle;
+#[cfg(test)]
+mod tests_portable;
 #[cfg(test)]
 mod tests_recovery;
 

@@ -132,6 +132,30 @@ async fn handle_connection<E: Engine + 'static>(
             })
             .await
         }
+        ipc::Request::Export {
+            session,
+            output_path,
+            force,
+            with_accel,
+        } => {
+            let result = daemon
+                .export(
+                    &session,
+                    std::path::Path::new(&output_path),
+                    force,
+                    with_accel,
+                )
+                .await
+                .map(Response::Run);
+            send_result(&mut stream, result).await
+        }
+        ipc::Request::Import { path, name } => {
+            let result = daemon
+                .import(std::path::Path::new(&path), name)
+                .await
+                .map(Response::Run);
+            send_result(&mut stream, result).await
+        }
     }
 }
 

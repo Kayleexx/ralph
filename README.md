@@ -23,6 +23,10 @@ and committed conversation history across vLLM worker crashes and daemon restart
 - `ralph hibernate <session>` — a stronger pause: same GPU release, but best-effort
   (logical-only hibernation is fine if the KV checkpoint can't be saved). A background
   idle sweep also auto-hibernates sessions left active and untouched for a while
+- `ralph export <session> [--output path] [--force] [--with-accel]` / `ralph import
+  <path.ralph> [--name name]` — a session's durable history (and optionally its KV
+  checkpoint) as a portable, checksummed `.ralph` archive; import lands paused and
+  resumes fast on a matching machine, portable otherwise
 - `ralph chat <session>` — interactive back-and-forth with a session
 - `ralph ps` / `ralph inspect <session>` — list and inspect sessions (typo-tolerant:
   `ralph inspect dem` suggests `demo`)
@@ -67,6 +71,7 @@ ralph ps
 ralph --json inspect demo
 ralph recover demo                                    # after worker loss
 ralph hibernate demo && ralph resume demo              # release/reattach the GPU worker
+ralph export demo --with-accel && ralph import demo.ralph --name demo-copy
 ```
 
 Ctrl-C during `query`/`chat` cancels that one generation without touching the session.
@@ -97,9 +102,10 @@ a separate, manual check:
 RALPH_E2E_VLLM=1 cargo test --test e2e_vllm -- --ignored --test-threads=1
 RALPH_E2E_VLLM=1 cargo test --test e2e_phase3 -- --ignored --test-threads=1
 RALPH_E2E_VLLM=1 cargo test --test e2e_phase4 -- --ignored --test-threads=1
+RALPH_E2E_VLLM=1 cargo test --test e2e_phase5 -- --ignored --test-threads=1
 ```
 
-These use the locally built binary, isolated data roots, and small Qwen models. Coverage
-includes worker crashes at various points, daemon restarts during/after recovery,
-Ctrl-C/disconnect/cancellation, checkpoint/pause/resume fast-vs-portable decisions, and
-hibernate's GPU release and resume round trip.
+These use the locally built binary, isolated data roots, and small Qwen models: worker
+crashes, daemon restarts during/after recovery, Ctrl-C/disconnect/cancellation,
+checkpoint/pause/resume/hibernate fast-vs-portable decisions, and export/import round
+trips (with and without KV state, plus corrupted-artifact rejection).

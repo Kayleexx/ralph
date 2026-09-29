@@ -2,6 +2,7 @@
 //! sends the request, and renders the human/JSON/quiet output for each command.
 mod generation;
 mod lifecycle;
+mod portable;
 use std::io::{IsTerminal, Read, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -238,6 +239,7 @@ pub async fn run_run(home: &Path, cli: Flags, model: Option<String>, name: Optio
 
 pub use generation::{run_query, run_recover};
 pub use lifecycle::{run_checkpoint, run_hibernate, run_pause, run_resume};
+pub use portable::{run_export, run_import};
 
 pub async fn run_ps(home: &Path, cli: Flags) -> i32 {
     let mut stream = match connect(home, cli).await {

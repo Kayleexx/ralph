@@ -35,6 +35,16 @@ pub enum Request {
         fast_only: bool,
         portable: bool,
     },
+    Export {
+        session: String,
+        output_path: String,
+        force: bool,
+        with_accel: bool,
+    },
+    Import {
+        path: String,
+        name: Option<String>,
+    },
 }
 
 /// Sent by the client in place of a new request while a `Query` is streaming, to cancel

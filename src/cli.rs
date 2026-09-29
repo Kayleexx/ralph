@@ -89,6 +89,29 @@ pub enum Command {
         #[arg(long)]
         portable: bool,
     },
+    /// Write a session's durable history (and optionally its KV checkpoint) to a
+    /// portable `.ralph` artifact
+    Export {
+        /// Session name, id, or a unique id prefix.
+        session: String,
+        /// Output path. Defaults to ./<session-name>.ralph in the current directory.
+        #[arg(long)]
+        output: Option<String>,
+        /// Overwrite the output path if it already exists.
+        #[arg(long)]
+        force: bool,
+        /// Also include the session's KV checkpoint, if one exists.
+        #[arg(long)]
+        with_accel: bool,
+    },
+    /// Reconstruct a session from a `.ralph` artifact, landing it paused
+    Import {
+        /// Path to a `.ralph` artifact.
+        path: String,
+        /// Session name for the imported session. Defaults to the exported name.
+        #[arg(long)]
+        name: Option<String>,
+    },
     /// Check the local environment (GPU, vLLM, disk, sqlite) — never mutates anything
     Doctor,
     /// Internal: run the daemon loop in the foreground. Not part of the public surface.

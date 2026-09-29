@@ -215,6 +215,35 @@ impl Harness {
             .join(session_id)
             .join("kvcache")
     }
+    pub fn export(&self, output: &std::path::Path, with_accel: bool) -> Value {
+        let output = output.to_string_lossy().into_owned();
+        let mut args = vec!["export", SESSION, "--output", &output];
+        if with_accel {
+            args.push("--with-accel");
+        }
+        self.json(&args)
+    }
+    pub fn import(&self, path: &std::path::Path, name: &str) -> Value {
+        let path = path.to_string_lossy().into_owned();
+        self.json(&["import", &path, "--name", name])
+    }
+    pub fn resume_named(&self, name: &str) -> Value {
+        let out = self
+            .command()
+            .args(["--json", "resume", name])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice(&out.stdout).unwrap()
+    }
+    pub fn query_named(&self, name: &str, prompt: &str) -> Value {
+        self.json(&["query", name, prompt])
+    }
     pub fn spawn_query(&self, prompt: &str) -> Child {
         self.command()
             .args(["query", SESSION, prompt])
