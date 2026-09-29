@@ -6,11 +6,32 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Request {
-    Run { model: String, name: Option<String> },
-    Query { session: String, prompt: String },
+    Run {
+        model: String,
+        name: Option<String>,
+    },
+    Query {
+        session: String,
+        prompt: String,
+    },
     Ps,
-    Inspect { session: String },
-    Recover { session: String },
+    Inspect {
+        session: String,
+    },
+    Recover {
+        session: String,
+    },
+    Checkpoint {
+        session: String,
+    },
+    Pause {
+        session: String,
+    },
+    Resume {
+        session: String,
+        fast_only: bool,
+        portable: bool,
+    },
 }
 
 /// Sent by the client in place of a new request while a `Query` is streaming, to cancel
@@ -29,6 +50,14 @@ pub struct SessionInfo {
     pub pid: Option<i64>,
     pub location: String,
     pub token_count: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ResumeInfo {
+    pub session: SessionInfo,
+    /// Best-effort, honest-only: `false` unless a still-compatible KV directory with
+    /// actual content was found — never claims a native restore that didn't happen.
+    pub native: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -58,6 +87,7 @@ pub enum Response {
     Run(SessionInfo),
     Ps(Vec<SessionInfo>),
     Inspect(InspectInfo),
+    Resume(ResumeInfo),
     Error(ErrorPayload),
 }
 

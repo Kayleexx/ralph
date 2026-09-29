@@ -1,6 +1,7 @@
 //! Session lifecycle state machine.
 //!
-//! Reserved states retain stable serialization but have no valid transitions yet.
+//! States reserved for a later phase retain stable serialization but have no valid
+//! transitions yet.
 use std::fmt;
 use std::str::FromStr;
 
@@ -11,11 +12,8 @@ pub enum SessionState {
     Created,
     Starting,
     Active,
-    /// Reserved for pause/resume; currently unreachable.
     Pausing,
-    /// Reserved for pause/resume; currently unreachable.
     Paused,
-    /// Reserved for pause/resume; currently unreachable.
     Resuming,
     /// Reserved for hibernation; currently unreachable.
     Hibernated,
@@ -114,6 +112,19 @@ pub fn validate_transition(from: SessionState, to: SessionState) -> Result<(), S
         (Recovering, Stopped) => Ok(()),
         // reserved for a genuinely unrecoverable session found during recovery.
         (Recovering, Failed) => Ok(()),
+        // `ralph pause`: generation stopped and durable state flushed before this fires.
+        (Active, Pausing) => Ok(()),
+        (Pausing, Paused) => Ok(()),
+        // pause failed to reach a safe boundary (or was interrupted); the session was
+        // never actually paused, so it goes back to Active rather than getting stuck.
+        (Pausing, Active) => Ok(()),
+        // `ralph resume`: fingerprint decides fast vs. portable, but the transition itself
+        // is the same either way.
+        (Paused, Resuming) => Ok(()),
+        (Resuming, Active) => Ok(()),
+        // resume failed (worker admission, prefill, ...); durable state is untouched, so
+        // the session stays Paused rather than landing in a new, unreachable state.
+        (Resuming, Paused) => Ok(()),
         (from, to) => Err(StateError { from, to }),
     }
 }
@@ -155,7 +166,17 @@ mod tests {
     }
 
     #[test]
-    fn transitions_into_reserved_states_are_rejected() {
+    fn pause_and_resume_transitions_succeed() {
+        assert!(validate_transition(SessionState::Active, SessionState::Pausing).is_ok());
+        assert!(validate_transition(SessionState::Pausing, SessionState::Paused).is_ok());
+        assert!(validate_transition(SessionState::Pausing, SessionState::Active).is_ok());
+        assert!(validate_transition(SessionState::Paused, SessionState::Resuming).is_ok());
+        assert!(validate_transition(SessionState::Resuming, SessionState::Active).is_ok());
+        assert!(validate_transition(SessionState::Resuming, SessionState::Paused).is_ok());
+    }
+
+    #[test]
+    fn skipping_straight_into_paused_or_hibernated_is_rejected() {
         assert!(validate_transition(SessionState::Active, SessionState::Paused).is_err());
         assert!(validate_transition(SessionState::Paused, SessionState::Active).is_err());
         assert!(validate_transition(SessionState::Active, SessionState::Hibernated).is_err());

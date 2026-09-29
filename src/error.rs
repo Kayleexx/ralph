@@ -16,6 +16,10 @@ pub enum CliError {
         source: Box<CliError>,
         session: String,
         model: String,
+        /// What the session is actually left as (never a fake "stopped" for a resume/pause
+        /// failure that really leaves it Paused) — drives both the detail line and which
+        /// recovery command `next` suggests.
+        resulting_state: &'static str,
     },
     #[error("could not persist session state")]
     Persistence { diagnostic: String },
@@ -48,11 +52,29 @@ impl CliError {
             _ => None,
         }
     }
+
+    /// For an operation whose failure path leaves the session `Stopped` (run/recover).
     pub fn for_session(self, session: &str, model: &str) -> Self {
+        self.for_session_state(session, model, "stopped")
+    }
+
+    /// For an operation whose failure path leaves the session `Paused` (pause/resume) —
+    /// never reuses the `Stopped`/`ralph recover` wording for a state that isn't Stopped.
+    pub fn for_paused_session(self, session: &str, model: &str) -> Self {
+        self.for_session_state(session, model, "paused")
+    }
+
+    pub fn for_session_state(
+        self,
+        session: &str,
+        model: &str,
+        resulting_state: &'static str,
+    ) -> Self {
         Self::SessionOperation {
             source: Box::new(self),
             session: session.into(),
             model: model.into(),
+            resulting_state,
         }
     }
 }
@@ -124,20 +146,24 @@ pub fn envelope(err: &CliError) -> Envelope {
             source,
             session,
             model,
+            resulting_state,
         } => {
             let mut envelope = envelope(source);
             if !envelope.summary.starts_with(model) {
                 envelope.summary = format!("{model}: {}", envelope.summary);
             }
-            envelope
-                .detail
-                .retain(|detail| detail != "session is stopped; durable state preserved");
+            envelope.detail.retain(|detail| {
+                detail
+                    != &format!("session {session:?} is {resulting_state}; durable state preserved")
+            });
             envelope.detail.push(format!(
-                "session {session:?} is stopped; durable state preserved"
+                "session {session:?} is {resulting_state}; durable state preserved"
             ));
-            envelope.next = Some(format!(
-                "resolve the cause, then run: ralph recover {session}"
-            ));
+            envelope.next = Some(match *resulting_state {
+                "paused" => format!("resolve the cause, then run: ralph resume {session}"),
+                "active" => "resolve the cause, then retry".to_string(),
+                _ => format!("resolve the cause, then run: ralph recover {session}"),
+            });
             envelope
         }
         CliError::Persistence { .. } => Envelope {

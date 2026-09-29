@@ -7,6 +7,7 @@ pub mod profiles;
 pub mod vllm;
 
 use std::future::Future;
+use std::path::PathBuf;
 use std::process::ExitStatus;
 
 use thiserror::Error;
@@ -36,11 +37,24 @@ pub enum EngineError {
     Io(#[from] std::io::Error),
 }
 
+/// Points a worker at a per-session, fingerprint-gated KV directory. Passing this is
+/// opportunistic acceleration only — never required for correctness, since a missing or
+/// stale directory just means an ordinary cold prefill (see `daemon/lifecycle.rs`).
+#[derive(Debug, Clone)]
+pub struct KvOffloadSpec {
+    pub root_dir: PathBuf,
+    pub cpu_bytes: u64,
+    /// Pinned rather than left to vLLM's own random default so a crashed worker's
+    /// `/dev/shm/vllm_offload_<engine_id>.mmap` can be found and unlinked afterward.
+    pub engine_id: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct ModelSpec {
     pub model: String,
     pub revision: Option<String>,
     pub profile: Option<profiles::WorkerProfile>,
+    pub kv_offload: Option<KvOffloadSpec>,
 }
 
 #[derive(Debug, Clone)]

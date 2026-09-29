@@ -9,7 +9,7 @@ use std::time::Instant;
 use tokio::sync::Mutex as AsyncMutex;
 
 use super::restart::RestartPolicy;
-use super::{Daemon, WorkerEntry, map_engine_error, to_session_info};
+use super::{Daemon, WorkerEntry, cancelled, map_engine_error, to_session_info};
 use crate::engine::{Engine, ResolvedModel};
 use crate::error::CliError;
 use crate::ipc::SessionInfo;
@@ -25,6 +25,7 @@ impl<E: Engine + 'static> Daemon<E> {
         model: &str,
         session_id: &str,
         cancel: &mut Option<tokio::sync::oneshot::Receiver<()>>,
+        allow_native: bool,
     ) -> Result<(Arc<AsyncMutex<E>>, ResolvedModel, Option<i64>), CliError> {
         // This guard reserves startup; registry locks are released before I/O.
         let _startup = self.startup.try_lock().map_err(|_| {
@@ -74,7 +75,7 @@ impl<E: Engine + 'static> Daemon<E> {
 
         let dir = session::session_dir(&self.sessions_root, session_id);
         let mut engine = (self.make_engine)(session::vllm_log_path(&dir));
-        let spec = self.admitted_spec(&row).await?;
+        let spec = self.admitted_spec(&row, allow_native).await?;
         let started = {
             let startup = engine.start_model(&spec);
             tokio::pin!(startup);
@@ -107,6 +108,7 @@ impl<E: Engine + 'static> Daemon<E> {
                 engine: handle.clone(),
                 resolved: resolved.clone(),
                 profile: spec.profile,
+                kv_engine_id: spec.kv_offload.map(|kv| kv.engine_id),
                 session_ids: vec![session_id.to_string()],
                 last_active: Instant::now(),
             },
@@ -175,7 +177,7 @@ impl<E: Engine + 'static> Daemon<E> {
             self.transition(&row.id, row.state, SessionState::Recovering, None)?;
         }
         let attach = self
-            .attach_or_start_worker(&row.model, &row.id, &mut cancel)
+            .attach_or_start_worker(&row.model, &row.id, &mut cancel, true)
             .await;
         let (engine, resolved, pid) = match attach {
             Ok(v) => v,
@@ -225,7 +227,14 @@ pub(super) async fn handle_worker_loss<E: Engine + 'static>(
     daemon: &Arc<Daemon<E>>,
     model: String,
     session_ids: Vec<String>,
+    kv_engine_id: Option<String>,
 ) {
+    // vLLM does not unlink its own `/dev/shm/vllm_offload_<engine_id>.mmap` on SIGKILL
+    // (confirmed by reproducing it) — the crashed worker can no longer do it itself, so
+    // the crash handler owns this cleanup.
+    if let Some(engine_id) = &kv_engine_id {
+        crate::engine::vllm::kv_offload::cleanup_shm(engine_id);
+    }
     for id in &session_ids {
         let _guard = daemon.locks.acquire(id).await;
         let row = { daemon.storage().resolve(id) };
@@ -258,7 +267,7 @@ pub(super) async fn handle_worker_loss<E: Engine + 'static>(
             break false;
         }
         match daemon
-            .attach_or_start_worker(&model, session_id, &mut cancel)
+            .attach_or_start_worker(&model, session_id, &mut cancel, true)
             .await
         {
             Ok(_) => break true,
@@ -295,14 +304,5 @@ pub(super) async fn handle_worker_loss<E: Engine + 'static>(
                 eprintln!("cannot record exhausted recovery: {error}");
             }
         }
-    }
-}
-
-async fn cancelled(cancel: &mut Option<tokio::sync::oneshot::Receiver<()>>) {
-    match cancel {
-        Some(cancel) => {
-            let _ = cancel.await;
-        }
-        None => std::future::pending::<()>().await,
     }
 }

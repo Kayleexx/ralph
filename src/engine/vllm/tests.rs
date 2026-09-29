@@ -1,5 +1,8 @@
+use std::path::Path;
+
 use super::*;
 use crate::engine::Role;
+use spawn::{pick_free_port, resolve_vllm_binary_from, vllm_serve_args};
 
 #[test]
 fn free_ports_are_distinct() {
@@ -44,14 +47,14 @@ fn resolve_vllm_binary_falls_back_to_path_when_nothing_else_exists() {
 
 #[test]
 fn serve_args_enable_sleep_mode() {
-    let args = vllm_serve_args("Qwen/Qwen2.5-0.5B-Instruct", 8000, None, None);
+    let args = vllm_serve_args("Qwen/Qwen2.5-0.5B-Instruct", 8000, None, None, None);
     assert!(args.contains(&"--enable-sleep-mode".to_string()));
     assert!(!args.contains(&"--revision".to_string()));
 }
 
 #[test]
 fn serve_args_include_revision_when_requested() {
-    let args = vllm_serve_args("model", 8000, Some("abc123"), None);
+    let args = vllm_serve_args("model", 8000, Some("abc123"), None, None);
     let pos = args.iter().position(|a| a == "--revision").unwrap();
     assert_eq!(args[pos + 1], "abc123");
     let tokenizer = args
@@ -66,7 +69,7 @@ fn measured_launch_sets_context_and_kv_together_without_automatic_pool_sizing() 
     let profile = super::super::profiles::measured(super::super::profiles::QWEN3)
         .unwrap()
         .1[1];
-    let args = vllm_serve_args("model", 8000, Some("revision"), Some(profile));
+    let args = vllm_serve_args("model", 8000, Some("revision"), Some(profile), None);
     for (flag, value) in [
         ("--max-model-len", "2048"),
         ("--kv-cache-memory-bytes", "536870912"),
@@ -77,6 +80,21 @@ fn measured_launch_sets_context_and_kv_together_without_automatic_pool_sizing() 
         assert_eq!(args[at + 1], value);
     }
     assert!(args.contains(&"--enforce-eager".into()));
+}
+
+#[test]
+fn serve_args_include_kv_transfer_config_when_offloading() {
+    let spec = crate::engine::KvOffloadSpec {
+        root_dir: PathBuf::from("/tmp/kv"),
+        cpu_bytes: 1024,
+        engine_id: "ralph-01AAA".to_string(),
+    };
+    let args = vllm_serve_args("model", 8000, None, None, Some(&spec));
+    let at = args
+        .iter()
+        .position(|a| a == "--kv-transfer-config")
+        .unwrap();
+    assert!(args[at + 1].contains("ralph-01AAA"));
 }
 
 #[tokio::test]

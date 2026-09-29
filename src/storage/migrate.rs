@@ -17,6 +17,7 @@ const MIGRATIONS: &[Migration] = &[
     migrate_v4_tokens,
     migrate_v5_integrity,
     migrate_v6_profiles,
+    migrate_v7_checkpoints,
 ];
 
 pub(crate) fn run(conn: &Connection) -> Result<(), StorageError> {
@@ -102,6 +103,11 @@ fn migrate_v6_profiles(conn: &Connection) -> Result<(), StorageError> {
     conn.execute_batch(
         "CREATE TABLE session_profiles (session_id TEXT PRIMARY KEY, profile TEXT NOT NULL)",
     )?;
+    Ok(())
+}
+
+fn migrate_v7_checkpoints(conn: &Connection) -> Result<(), StorageError> {
+    conn.execute_batch(super::checkpoints::SCHEMA)?;
     Ok(())
 }
 

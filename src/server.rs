@@ -35,6 +35,14 @@ pub async fn run_daemon<E: Engine + 'static>(
     // Holding the lock means any leftover socket file is stale (from a prior crash),
     // never a live daemon — safe to remove before binding.
     let _ = std::fs::remove_file(&socket_path);
+    // Best-effort only: lets a CLI reusing this daemon notice it was started from an
+    // older build than the CLI's own binary (e.g. after `cargo install`/rebuild without
+    // restarting the daemon) and warn instead of silently running mismatched code
+    // indefinitely. A missing/stale/reused pid is never fatal here — see `client.rs`.
+    let _ = std::fs::write(
+        ralph_home.join("daemon.pid"),
+        std::process::id().to_string(),
+    );
 
     let db_path = ralph_home.join("ralph.db");
     let storage = Storage::open(&db_path).map_err(std::io::Error::other)?;
@@ -62,7 +70,7 @@ async fn handle_connection<E: Engine + 'static>(
     };
     match request {
         ipc::Request::Run { model, name } => {
-            lifecycle(&mut stream, |cancel| {
+            lifecycle(&mut stream, Response::Run, |cancel| {
                 daemon.run_cancellable(model, name, Some(cancel))
             })
             .await
@@ -75,8 +83,45 @@ async fn handle_connection<E: Engine + 'static>(
             handle_query(&daemon, &mut stream, &session, &prompt).await
         }
         ipc::Request::Recover { session } => {
-            lifecycle(&mut stream, |cancel| {
+            lifecycle(&mut stream, Response::Run, |cancel| {
                 daemon.recover_cancellable(&session, Some(cancel))
+            })
+            .await
+        }
+        ipc::Request::Checkpoint { session } => {
+            send_result(
+                &mut stream,
+                daemon.checkpoint(&session).await.map(Response::Run),
+            )
+            .await
+        }
+        ipc::Request::Pause { session } => {
+            lifecycle(&mut stream, Response::Run, |cancel| {
+                daemon.pause_cancellable(&session, Some(cancel))
+            })
+            .await
+        }
+        ipc::Request::Resume {
+            session,
+            fast_only,
+            portable,
+        } => {
+            let mode = match (fast_only, portable) {
+                (true, true) => {
+                    return send_result(
+                        &mut stream,
+                        Err(CliError::Usage(
+                            "--fast-only and --portable are mutually exclusive".into(),
+                        )),
+                    )
+                    .await;
+                }
+                (true, false) => crate::daemon::lifecycle::ResumeMode::FastOnly,
+                (false, true) => crate::daemon::lifecycle::ResumeMode::Portable,
+                (false, false) => crate::daemon::lifecycle::ResumeMode::Auto,
+            };
+            lifecycle(&mut stream, Response::Resume, |cancel| {
+                daemon.resume_cancellable(&session, mode, Some(cancel))
             })
             .await
         }
@@ -102,8 +147,9 @@ fn to_error_payload(e: &CliError) -> ErrorPayload {
     }
 }
 
-async fn lifecycle<F: std::future::Future<Output = Result<crate::ipc::SessionInfo, CliError>>>(
+async fn lifecycle<T, F: std::future::Future<Output = Result<T, CliError>>>(
     stream: &mut UnixStream,
+    to_response: impl FnOnce(T) -> Response,
     operation: impl FnOnce(tokio::sync::oneshot::Receiver<()>) -> F,
 ) -> std::io::Result<()> {
     let (mut reader, mut writer) = stream.split();
@@ -118,5 +164,5 @@ async fn lifecycle<F: std::future::Future<Output = Result<crate::ipc::SessionInf
             operation.await
         }
     };
-    send_result(&mut writer, result.map(Response::Run)).await
+    send_result(&mut writer, result.map(to_response)).await
 }

@@ -12,6 +12,7 @@ use thiserror::Error;
 use crate::state::SessionState;
 use crate::typo::suggest_similar;
 
+pub mod checkpoints;
 mod migrate;
 mod profiles;
 mod restarts;

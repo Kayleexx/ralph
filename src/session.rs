@@ -93,6 +93,12 @@ pub fn vllm_log_path(dir: &Path) -> PathBuf {
     dir.join("vllm.log")
 }
 
+/// Per-session, never shared across sessions — this is what makes cross-session KV
+/// contamination structurally impossible regardless of vLLM's own directory hashing.
+pub fn kvcache_dir(dir: &Path) -> PathBuf {
+    dir.join("kvcache")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

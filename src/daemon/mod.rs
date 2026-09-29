@@ -18,6 +18,7 @@ use crate::state::{self, SessionState};
 use crate::storage::{SessionRow, Storage, StorageError};
 
 mod admission;
+pub(crate) mod lifecycle;
 mod query;
 mod recovery;
 mod restart;
@@ -25,6 +26,8 @@ mod restart;
 pub(crate) mod tests;
 #[cfg(test)]
 mod tests_admission;
+#[cfg(test)]
+mod tests_lifecycle;
 #[cfg(test)]
 mod tests_recovery;
 
@@ -40,6 +43,10 @@ struct WorkerEntry<E: Engine> {
     engine: Arc<AsyncMutex<E>>,
     resolved: ResolvedModel,
     profile: Option<crate::engine::profiles::WorkerProfile>,
+    /// Set only when this worker was started with `--kv-transfer-config`; lets a crash
+    /// handler unlink the matching `/dev/shm/vllm_offload_<engine_id>.mmap` (vLLM itself
+    /// does not on SIGKILL — confirmed by reproducing it).
+    kv_engine_id: Option<String>,
     session_ids: Vec<String>,
     last_active: Instant,
 }
@@ -197,7 +204,10 @@ impl<E: Engine + 'static> Daemon<E> {
             .map_err(|e| CliError::Other(e.into()))?;
         self.transition(&id, SessionState::Created, SessionState::Starting, None)?;
 
-        match self.attach_or_start_worker(&model, &id, &mut cancel).await {
+        match self
+            .attach_or_start_worker(&model, &id, &mut cancel, true)
+            .await
+        {
             Ok((_, resolved, pid)) => {
                 self.storage().set_resolved(
                     &id,
@@ -265,22 +275,20 @@ impl<E: Engine + 'static> Daemon<E> {
                 eprintln!("worker cleanup failed: {error}");
                 return;
             }
-            let session_ids = {
+            let (session_ids, kv_engine_id) = {
                 let mut workers = daemon.workers.lock().await;
                 if workers
                     .get(&model)
                     .is_some_and(|entry| Arc::ptr_eq(&entry.engine, &handle))
                 {
-                    workers
-                        .remove(&model)
-                        .map(|entry| entry.session_ids)
-                        .unwrap_or_default()
+                    let entry = workers.remove(&model).unwrap();
+                    (entry.session_ids, entry.kv_engine_id)
                 } else {
-                    Vec::new()
+                    (Vec::new(), None)
                 }
             };
             drop(startup);
-            recovery::handle_worker_loss(&daemon, model, session_ids).await;
+            recovery::handle_worker_loss(&daemon, model, session_ids, kv_engine_id).await;
         });
     }
 
@@ -304,10 +312,15 @@ impl<E: Engine + 'static> Daemon<E> {
             SessionState::Failed => "broken",
             _ => "degraded",
         };
+        let fast_restore = if self.kv_offload_for(&row).is_some() {
+            "available"
+        } else {
+            "unavailable"
+        };
         Ok(InspectInfo {
             session: to_session_info(&row),
             recoverability: if complete { recoverability } else { "degraded" }.to_string(),
-            fast_restore: "unavailable".to_string(),
+            fast_restore: fast_restore.to_string(),
             last_failure: self.storage().last_worker_failure(&row.model)?,
             portable_state: if complete { "complete" } else { "incomplete" }.to_string(),
         })
@@ -325,6 +338,17 @@ fn to_session_info(row: &SessionRow) -> SessionInfo {
         pid: row.pid,
         location: row.location.clone(),
         token_count: row.token_count,
+    }
+}
+
+/// Shared by every cancellable long-running operation (`run`, `recover`, `resume`):
+/// resolves when the caller sends `Cancel`, or never if there's nothing to cancel.
+pub(crate) async fn cancelled(cancel: &mut Option<tokio::sync::oneshot::Receiver<()>>) {
+    match cancel {
+        Some(cancel) => {
+            let _ = cancel.await;
+        }
+        None => std::future::pending::<()>().await,
     }
 }
 

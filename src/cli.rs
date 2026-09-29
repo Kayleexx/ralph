@@ -61,6 +61,28 @@ pub enum Command {
         /// Session name, id, or a unique id prefix.
         session: String,
     },
+    /// Record a durable pointer to the session's current KV cache, for a faster resume
+    Checkpoint {
+        /// Session name, id, or a unique id prefix.
+        session: String,
+    },
+    /// Stop generation, flush durable state, and free the session's GPU worker
+    Pause {
+        /// Session name, id, or a unique id prefix.
+        session: String,
+    },
+    /// Reattach a paused session, fast (native KV) if a compatible checkpoint exists
+    Resume {
+        /// Session name, id, or a unique id prefix.
+        session: String,
+        /// Fail rather than fall back to portable reconstruction if no compatible
+        /// checkpoint is available.
+        #[arg(long, conflicts_with = "portable")]
+        fast_only: bool,
+        /// Always reconstruct from the durable token log, ignoring any checkpoint.
+        #[arg(long)]
+        portable: bool,
+    },
     /// Check the local environment (GPU, vLLM, disk, sqlite) — never mutates anything
     Doctor,
     /// Internal: run the daemon loop in the foreground. Not part of the public surface.

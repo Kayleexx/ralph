@@ -118,7 +118,12 @@ impl<E: Engine + 'static> Daemon<E> {
         Ok((gpu.free_mib, reserved))
     }
 
-    pub(super) async fn admitted_spec(&self, row: &SessionRow) -> Result<ModelSpec, CliError> {
+    pub(super) async fn admitted_spec(
+        &self,
+        row: &SessionRow,
+        allow_native: bool,
+    ) -> Result<ModelSpec, CliError> {
+        let kv_offload = allow_native.then(|| self.kv_offload_for(row)).flatten();
         let saved = self.storage().worker_profile(&row.id)?;
         let other_unmeasured = self
             .workers
@@ -137,6 +142,7 @@ impl<E: Engine + 'static> Daemon<E> {
                 model: row.model.clone(),
                 revision: row.model_revision.clone(),
                 profile: None,
+                kv_offload,
             });
         };
         if other_unmeasured {
@@ -154,19 +160,31 @@ impl<E: Engine + 'static> Daemon<E> {
                     .into(),
             ));
         }
-        let (free, reserved) = self.available_vram().await?;
-        let profile = saved
-            .filter(|p| p.reservation_mib() + reserved <= free)
-            .or_else(|| {
-                if saved.is_none() {
-                    candidates
-                        .iter()
-                        .copied()
-                        .find(|p| p.reservation_mib() + reserved <= free)
-                } else {
-                    None
-                }
-            });
+        // The GPU driver can lag slightly reclaiming VRAM after a worker process exits
+        // (e.g. right after `ralph pause` stops one and a resume immediately follows) —
+        // a bounded retry here is measuring a real, transient external resource, not
+        // papering over a logic bug (unlike a sleep-based test wait).
+        let mut attempt = 0;
+        let (free, reserved, profile) = loop {
+            let (free, reserved) = self.available_vram().await?;
+            let profile = saved
+                .filter(|p| p.reservation_mib() + reserved <= free)
+                .or_else(|| {
+                    if saved.is_none() {
+                        candidates
+                            .iter()
+                            .copied()
+                            .find(|p| p.reservation_mib() + reserved <= free)
+                    } else {
+                        None
+                    }
+                });
+            attempt += 1;
+            if profile.is_some() || attempt >= 5 {
+                break (free, reserved, profile);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        };
         let Some(profile) = profile else {
             let minimum = saved
                 .or_else(|| candidates.last().copied())
@@ -183,6 +201,7 @@ impl<E: Engine + 'static> Daemon<E> {
             model: row.model.clone(),
             revision: Some(revision.into()),
             profile: Some(profile),
+            kv_offload,
         })
     }
 

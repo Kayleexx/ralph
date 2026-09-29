@@ -169,9 +169,35 @@ pub(crate) fn gpu_count() -> Option<usize> {
     )
 }
 
+/// Below the smallest measured worker's reservation (see `engine::profiles`) plus
+/// headroom — under this, a `ralph run` is expected to fail on VRAM alone, so surfacing
+/// it here beats letting the model process itself crash with a raw CUDA-OOM traceback.
+const LOW_FREE_VRAM_MIB: u64 = 3072;
+
+fn free_vram_mib() -> Option<u64> {
+    let output = Command::new("nvidia-smi")
+        .args(["--query-gpu=memory.free", "--format=csv,noheader,nounits"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout).trim().parse().ok()
+}
+
 fn check_gpu() -> CheckResult {
     match gpu_count() {
-        Some(count) if count > 0 => pass("gpu", format!("{count} gpu(s) visible")),
+        Some(count) if count > 0 => match free_vram_mib() {
+            Some(free) if free < LOW_FREE_VRAM_MIB => warn(
+                "gpu",
+                format!(
+                    "{count} gpu(s) visible, only {free} MiB free; check for leftover \
+                     worker processes with: nvidia-smi --query-compute-apps=pid,used_memory,process_name --format=csv"
+                ),
+            ),
+            Some(free) => pass("gpu", format!("{count} gpu(s) visible, {free} MiB free")),
+            None => pass("gpu", format!("{count} gpu(s) visible")),
+        },
         Some(_) => fail("gpu", "nvidia-smi reported no gpus"),
         None => fail("gpu", "cannot run nvidia-smi"),
     }

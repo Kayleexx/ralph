@@ -1,3 +1,8 @@
+// Shared across multiple integration-test binaries (e2e_vllm, e2e_phase3, ...), each of
+// which recompiles this module as its own crate and only calls the subset it needs — that
+// makes every helper "unused" in some binary's own compilation, not actually dead code.
+#![allow(dead_code)]
+
 use rusqlite::Connection;
 use serde_json::Value;
 use std::io::{Read, Write};
@@ -175,6 +180,37 @@ impl Harness {
         wait_until(Duration::from_secs(10), || {
             self.inspect()["session"]["state"] != "active"
         });
+    }
+    pub fn checkpoint(&self) -> Value {
+        self.json(&["checkpoint", SESSION])
+    }
+    pub fn pause(&self) -> Value {
+        self.json(&["pause", SESSION])
+    }
+    pub fn resume_json(&self, args: &[&str]) -> Output {
+        self.command()
+            .arg("--json")
+            .arg("resume")
+            .arg(SESSION)
+            .args(args)
+            .output()
+            .unwrap()
+    }
+    pub fn resume(&self) -> Value {
+        let out = self.resume_json(&[]);
+        assert!(
+            out.status.success(),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice(&out.stdout).unwrap()
+    }
+    pub fn kvcache_dir(&self, session_id: &str) -> PathBuf {
+        self.root()
+            .join("sessions")
+            .join(session_id)
+            .join("kvcache")
     }
     pub fn spawn_query(&self, prompt: &str) -> Child {
         self.command()

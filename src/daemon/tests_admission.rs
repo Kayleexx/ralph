@@ -160,7 +160,7 @@ async fn profile_survives_daemon_restart_and_corruption_is_rejected() {
     stored.test_execute("UPDATE session_profiles SET profile = '{\"max_context\":16384,\"kv_mib\":448,\"peak_mib\":1}'");
     let row = stored.resolve(&a.id).unwrap();
     d.workers.lock().await.clear();
-    assert!(d.admitted_spec(&row).await.is_err());
+    assert!(d.admitted_spec(&row, true).await.is_err());
 }
 
 #[tokio::test]

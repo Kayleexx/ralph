@@ -29,6 +29,7 @@ pub fn ralph_home() -> PathBuf {
 pub async fn connect_or_start(ralph_home: &Path) -> std::io::Result<UnixStream> {
     let socket_path = ralph_home.join("daemon.sock");
     if let Ok(stream) = UnixStream::connect(&socket_path).await {
+        warn_if_daemon_is_stale(ralph_home);
         return Ok(stream);
     }
 
@@ -56,6 +57,38 @@ pub async fn connect_or_start(ralph_home: &Path) -> std::io::Result<UnixStream> 
             ));
         }
         tokio::time::sleep(AUTOSTART_POLL_INTERVAL).await;
+    }
+}
+
+/// Best-effort, never fatal: an already-running daemon started from an older binary than
+/// this CLI silently keeps running that old code indefinitely (see README's "a running
+/// daemon keeps its current build" note) — that's exactly what turned an already-fixed
+/// bug back into a confusing raw crash once. Reads the daemon's own recorded pid and
+/// compares `/proc/<pid>/exe`'s mtime to this process's own binary; any failure (no pid
+/// file, process gone, permission denied, pid reused by something unrelated) is silently
+/// ignored rather than guessed at.
+fn warn_if_daemon_is_stale(ralph_home: &Path) {
+    let mtime = |path: &Path| std::fs::metadata(path).and_then(|m| m.modified()).ok();
+    let Some(current) = std::env::current_exe().ok().as_deref().and_then(mtime) else {
+        return;
+    };
+    let Some(pid) = std::fs::read_to_string(ralph_home.join("daemon.pid"))
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+    else {
+        return;
+    };
+    let Some(daemon) = std::fs::read_link(format!("/proc/{pid}/exe"))
+        .ok()
+        .as_deref()
+        .and_then(mtime)
+    else {
+        return;
+    };
+    if daemon < current {
+        eprintln!(
+            "warning: the running ralph daemon was started from an older build; restart it (stop the process, then run any ralph command) to pick up recent changes"
+        );
     }
 }
 

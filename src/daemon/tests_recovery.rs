@@ -75,6 +75,7 @@ async fn repeated_crash_converges_to_stopped_without_looping_forever() {
         &daemon,
         "broken-model".to_string(),
         vec!["01AAA".to_string()],
+        None,
     )
     .await;
 
@@ -233,7 +234,7 @@ async fn immediate_replacement_crashes_share_one_retry_budget() {
         engine.lock().await.stop_model().await.unwrap();
         tokio::time::timeout(
             Duration::from_secs(3),
-            recovery::handle_worker_loss(&daemon, "model".into(), vec![info.id.clone()]),
+            recovery::handle_worker_loss(&daemon, "model".into(), vec![info.id.clone()], None),
         )
         .await
         .unwrap();

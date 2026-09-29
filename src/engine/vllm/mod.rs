@@ -3,10 +3,9 @@
 //! never shelled out to per request.
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::net::TcpListener;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::ExitStatusExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
@@ -16,10 +15,14 @@ use tokio::sync::{mpsc, oneshot};
 use super::{
     ChatMessage, Engine, EngineError, GenerationHandle, HealthStatus, ModelSpec, ResolvedModel, hub,
 };
+pub(crate) use spawn::resolve_vllm_binary;
+use spawn::{pick_free_port, vllm_serve_args};
 use stream::stream_completion;
 
 mod diagnostics;
+pub mod kv_offload;
 pub(crate) mod ownership;
+mod spawn;
 mod stream;
 #[cfg(test)]
 mod tests;
@@ -60,82 +63,6 @@ impl VllmEngine {
     }
 }
 
-/// Checks, in order: an activated venv (`$VIRTUAL_ENV`, works from any directory once
-/// `source .venv/bin/activate` has run), a `.venv` in the current directory (works when
-/// `ralph` is run from inside the project without activating anything), then whatever
-/// `vllm` resolves to on `PATH`. `ralph` is often installed globally and run from
-/// wherever the user happens to be, so a CWD-relative check alone isn't enough.
-pub(crate) fn resolve_vllm_binary() -> PathBuf {
-    resolve_vllm_binary_from(
-        std::env::var("VIRTUAL_ENV").ok(),
-        Path::new(".venv/bin/vllm"),
-    )
-}
-
-/// Split out so tests can control both inputs directly, rather than mutating the real
-/// `VIRTUAL_ENV` process environment (`std::env::set_var` is `unsafe` on this toolchain).
-fn resolve_vllm_binary_from(virtual_env: Option<String>, cwd_venv: &Path) -> PathBuf {
-    if let Some(venv) = virtual_env {
-        let candidate = PathBuf::from(venv).join("bin/vllm");
-        if candidate.exists() {
-            return candidate;
-        }
-    }
-    if cwd_venv.exists() {
-        return cwd_venv.to_path_buf();
-    }
-    PathBuf::from("vllm")
-}
-
-fn pick_free_port() -> Result<u16, EngineError> {
-    let listener = TcpListener::bind("127.0.0.1:0")?;
-    Ok(listener.local_addr()?.port())
-}
-
-/// Split out for testability: the exact flags passed to `vllm serve`.
-fn vllm_serve_args(
-    model: &str,
-    port: u16,
-    revision: Option<&str>,
-    profile: Option<super::profiles::WorkerProfile>,
-) -> Vec<String> {
-    let mut args = vec![
-        "serve".to_string(),
-        model.to_string(),
-        "--port".to_string(),
-        port.to_string(),
-        "--gpu-memory-utilization".to_string(),
-        if profile.is_some() {
-            "0.1"
-        } else {
-            GPU_MEMORY_UTILIZATION
-        }
-        .to_string(),
-        // Eager execution keeps startup and runtime allocation predictable.
-        "--enforce-eager".to_string(),
-        // Preserve the existing idle sleep lifecycle.
-        "--enable-sleep-mode".to_string(),
-    ];
-    // Explicit KV bypasses automatic sizing; utilization still gates startup in vLLM.
-    if let Some(profile) = profile {
-        args.extend([
-            "--max-model-len".into(),
-            profile.max_context.to_string(),
-            "--kv-cache-memory-bytes".into(),
-            (u64::from(profile.kv_mib) << 20).to_string(),
-            "--dtype".into(),
-            "bfloat16".into(),
-        ]);
-    }
-    if let Some(revision) = revision {
-        args.push("--revision".to_string());
-        args.push(revision.to_string());
-        args.push("--tokenizer-revision".to_string());
-        args.push(revision.to_string());
-    }
-    args
-}
-
 impl Engine for VllmEngine {
     async fn start_model(&mut self, spec: &ModelSpec) -> Result<ResolvedModel, EngineError> {
         let port = pick_free_port()?;
@@ -165,6 +92,7 @@ impl Engine for VllmEngine {
             port,
             revision.as_deref(),
             spec.profile,
+            spec.kv_offload.as_ref(),
         ));
         // FlashInfer's sampler JIT-compiles a CUDA kernel on first use, which needs the
         // full CUDA toolkit (nvcc) rather than just the driver — not something Ralph
@@ -258,6 +186,12 @@ impl Engine for VllmEngine {
             "messages": messages,
             "stream": true,
             "return_token_ids": true,
+            // Deterministic (greedy) decoding: without this, vLLM falls back to whatever
+            // sampling defaults the model's own generation_config.json ships with, which
+            // can differ per model and makes the same prompt give a different — and
+            // sometimes wrong — answer on every query. A durable continuity runtime
+            // should not compound that with its own unconfigured randomness.
+            "temperature": 0,
         });
         let client = self.client.clone();
         tokio::spawn(stream_completion(client, url, body, tx, cancel_rx));
