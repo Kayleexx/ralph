@@ -80,6 +80,7 @@ async fn dispatch(cli: Cli) -> i32 {
         Command::Recover { session } => commands::run_recover(&home, flags, session).await,
         Command::Checkpoint { session } => commands::run_checkpoint(&home, flags, session).await,
         Command::Pause { session } => commands::run_pause(&home, flags, session).await,
+        Command::Hibernate { session } => commands::run_hibernate(&home, flags, session).await,
         Command::Resume {
             session,
             fast_only,

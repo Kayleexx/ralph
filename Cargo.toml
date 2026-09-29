@@ -14,7 +14,7 @@ anyhow = "1"
 ulid = "1"
 rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
-time = { version = "0.3", features = ["formatting"] }
+time = { version = "0.3", features = ["formatting", "parsing"] }
 fs2 = "0.4"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 

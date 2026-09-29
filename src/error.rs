@@ -58,12 +58,6 @@ impl CliError {
         self.for_session_state(session, model, "stopped")
     }
 
-    /// For an operation whose failure path leaves the session `Paused` (pause/resume) —
-    /// never reuses the `Stopped`/`ralph recover` wording for a state that isn't Stopped.
-    pub fn for_paused_session(self, session: &str, model: &str) -> Self {
-        self.for_session_state(session, model, "paused")
-    }
-
     pub fn for_session_state(
         self,
         session: &str,
@@ -160,7 +154,9 @@ pub fn envelope(err: &CliError) -> Envelope {
                 "session {session:?} is {resulting_state}; durable state preserved"
             ));
             envelope.next = Some(match *resulting_state {
-                "paused" => format!("resolve the cause, then run: ralph resume {session}"),
+                "paused" | "hibernated" => {
+                    format!("resolve the cause, then run: ralph resume {session}")
+                }
                 "active" => "resolve the cause, then retry".to_string(),
                 _ => format!("resolve the cause, then run: ralph recover {session}"),
             });

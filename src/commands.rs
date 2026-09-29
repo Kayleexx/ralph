@@ -237,7 +237,7 @@ pub async fn run_run(home: &Path, cli: Flags, model: Option<String>, name: Optio
 }
 
 pub use generation::{run_query, run_recover};
-pub use lifecycle::{run_checkpoint, run_pause, run_resume};
+pub use lifecycle::{run_checkpoint, run_hibernate, run_pause, run_resume};
 
 pub async fn run_ps(home: &Path, cli: Flags) -> i32 {
     let mut stream = match connect(home, cli).await {

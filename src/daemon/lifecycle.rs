@@ -27,6 +27,28 @@ pub enum ResumeMode {
     Portable,
 }
 
+/// Coarse total across every session's KV directory combined — good enough to bound
+/// disk growth from accumulating checkpoints (§16.12) without per-model/per-user
+/// accounting no part of this codebase has today.
+const KV_QUOTA_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+fn dir_size(dir: &std::path::Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|entry| {
+            let path = entry.path();
+            if path.is_dir() {
+                dir_size(&path)
+            } else {
+                entry.metadata().map(|m| m.len()).unwrap_or(0)
+            }
+        })
+        .sum()
+}
+
 impl<E: Engine + 'static> Daemon<E> {
     fn current_fingerprint(&self, row: &SessionRow) -> Fingerprint {
         Fingerprint {
@@ -79,6 +101,38 @@ impl<E: Engine + 'static> Daemon<E> {
         std::fs::read_dir(dir).is_ok_and(|mut entries| entries.next().is_some())
     }
 
+    /// Deletes the oldest *other* sessions' KV directories and checkpoint rows until the
+    /// combined total is back under budget (§16.12 "old acceleration snapshots
+    /// accumulate", §16.7 "NVMe tier full"). Only ever touches `checkpoints`/on-disk KV
+    /// directories — never the durable `sessions`/`token_turns` tables, so eviction can
+    /// never make a session unrecoverable (Invariant 2).
+    pub(super) fn enforce_kv_quota(&self, keep_session_id: &str) {
+        self.enforce_kv_quota_within(keep_session_id, KV_QUOTA_BYTES);
+    }
+
+    /// Split out so tests can exercise real eviction against a small quota instead of
+    /// writing multiple gigabytes of dummy data to disk.
+    pub(super) fn enforce_kv_quota_within(&self, keep_session_id: &str, quota_bytes: u64) {
+        let Ok(mut checkpoints) = self.storage().list_checkpoints() else {
+            return;
+        };
+        let mut total: u64 = checkpoints
+            .iter()
+            .map(|c| dir_size(std::path::Path::new(&c.kv_dir)))
+            .sum();
+        checkpoints.retain(|c| c.session_id != keep_session_id);
+        for checkpoint in checkpoints {
+            if total <= quota_bytes {
+                break;
+            }
+            let dir = std::path::Path::new(&checkpoint.kv_dir);
+            let freed = dir_size(dir);
+            let _ = std::fs::remove_dir_all(dir);
+            let _ = self.storage().delete_checkpoint(&checkpoint.session_id);
+            total = total.saturating_sub(freed);
+        }
+    }
+
     pub async fn checkpoint(self: &Arc<Self>, identifier: &str) -> Result<SessionInfo, CliError> {
         let row = self.storage().resolve(identifier)?;
         let _guard = self.locks.try_acquire(&row.id).ok_or_else(|| {
@@ -91,9 +145,41 @@ impl<E: Engine + 'static> Daemon<E> {
                 row.state
             )));
         }
+        self.enforce_kv_quota(&row.id);
         self.storage()
             .upsert_checkpoint(&self.checkpoint_row_for(&row))?;
         Ok(to_session_info(&row))
+    }
+
+    /// Detaches `row` from its shared worker, stopping it only once no other session
+    /// still needs it (sessions can share one worker per model — see `WorkerEntry`).
+    /// Shared by `pause_cancellable` and `hibernate_cancellable`: both release the GPU
+    /// worker identically, differing only in what happens to the checkpoint pointer and
+    /// which terminal state they land in.
+    async fn release_worker(&self, row: &SessionRow) -> Result<(), CliError> {
+        let stop_engine = {
+            let mut workers = self.workers.lock().await;
+            match workers.get_mut(&row.model) {
+                Some(entry) => {
+                    entry.session_ids.retain(|id| id != &row.id);
+                    if entry.session_ids.is_empty() {
+                        workers.remove(&row.model).map(|removed| removed.engine)
+                    } else {
+                        None
+                    }
+                }
+                None => None,
+            }
+        };
+        if let Some(engine) = stop_engine {
+            engine
+                .lock()
+                .await
+                .stop_model()
+                .await
+                .map_err(map_engine_error)?;
+        }
+        Ok(())
     }
 
     pub async fn pause_cancellable(
@@ -120,6 +206,7 @@ impl<E: Engine + 'static> Daemon<E> {
 
         // Durable token history is already flushed continuously (Phase 2); record the
         // checkpoint pointer before releasing the worker.
+        self.enforce_kv_quota(&row.id);
         if let Err(error) = self
             .storage()
             .upsert_checkpoint(&self.checkpoint_row_for(&row))
@@ -128,29 +215,65 @@ impl<E: Engine + 'static> Daemon<E> {
             return Err(error.into());
         }
 
-        // Detach from the shared worker; only stop it once no other session still needs
-        // it (sessions can share one worker per model — see `WorkerEntry`).
-        let stop_engine = {
-            let mut workers = self.workers.lock().await;
-            match workers.get_mut(&row.model) {
-                Some(entry) => {
-                    entry.session_ids.retain(|id| id != &row.id);
-                    if entry.session_ids.is_empty() {
-                        workers.remove(&row.model).map(|removed| removed.engine)
-                    } else {
-                        None
-                    }
-                }
-                None => None,
-            }
-        };
-        if let Some(engine) = stop_engine
-            && let Err(error) = engine.lock().await.stop_model().await
-        {
+        if let Err(error) = self.release_worker(&row).await {
             self.transition(&row.id, SessionState::Pausing, SessionState::Active, None)?;
-            return Err(map_engine_error(error).for_session_state(&row.name, &row.model, "active"));
+            return Err(error.for_session_state(&row.name, &row.model, "active"));
         }
         self.transition(&row.id, SessionState::Pausing, SessionState::Paused, None)?;
+        Ok(to_session_info(&self.storage().resolve(&row.id)?))
+    }
+
+    /// A "stronger pause": same GPU release as `pause_cancellable`, but the checkpoint
+    /// write is best-effort rather than fail-closed — §16.7 "Hibernation cannot save
+    /// acceleration state" explicitly allows a logical-only hibernation when the durable
+    /// token log is already complete, rather than blocking the whole operation on a KV
+    /// write that isn't the source of truth anyway.
+    pub async fn hibernate_cancellable(
+        self: &Arc<Self>,
+        identifier: &str,
+        _cancel: Option<oneshot::Receiver<()>>,
+    ) -> Result<SessionInfo, CliError> {
+        let row = self.storage().resolve(identifier)?;
+        let _guard = self.locks.try_acquire(&row.id).ok_or_else(|| {
+            CliError::InvalidState("operation already in progress for this session".into())
+        })?;
+        let row = self.storage().resolve(&row.id)?;
+        if row.state != SessionState::Active {
+            return Err(CliError::InvalidState(format!(
+                "session is {}, cannot hibernate it",
+                row.state
+            )));
+        }
+        self.transition(
+            &row.id,
+            SessionState::Active,
+            SessionState::Hibernating,
+            None,
+        )?;
+
+        self.enforce_kv_quota(&row.id);
+        if let Err(error) = self
+            .storage()
+            .upsert_checkpoint(&self.checkpoint_row_for(&row))
+        {
+            eprintln!("hibernate: checkpoint unavailable, continuing logical-only: {error}");
+        }
+
+        if let Err(error) = self.release_worker(&row).await {
+            self.transition(
+                &row.id,
+                SessionState::Hibernating,
+                SessionState::Active,
+                None,
+            )?;
+            return Err(error.for_session_state(&row.name, &row.model, "active"));
+        }
+        self.transition(
+            &row.id,
+            SessionState::Hibernating,
+            SessionState::Hibernated,
+            None,
+        )?;
         Ok(to_session_info(&self.storage().resolve(&row.id)?))
     }
 
@@ -171,12 +294,18 @@ impl<E: Engine + 'static> Daemon<E> {
                 native: false,
             });
         }
-        if row.state != SessionState::Paused {
+        if row.state != SessionState::Paused && row.state != SessionState::Hibernated {
             return Err(CliError::InvalidState(format!(
                 "session is {}, nothing to resume",
                 row.state
             )));
         }
+        let origin = row.state;
+        let origin_label = if origin == SessionState::Hibernated {
+            "hibernated"
+        } else {
+            "paused"
+        };
 
         let allow_native = mode != ResumeMode::Portable;
         let candidate = allow_native.then(|| self.kv_offload_for(&row)).flatten();
@@ -187,12 +316,16 @@ impl<E: Engine + 'static> Daemon<E> {
         }
         let native = candidate.is_some_and(|spec| Self::kv_dir_has_content(&spec.root_dir));
 
-        self.transition(&row.id, SessionState::Paused, SessionState::Resuming, None)?;
+        self.transition(&row.id, origin, SessionState::Resuming, None)?;
         let messages = match self.storage().replay_turns(&row.id) {
             Ok(messages) => messages,
             Err(error) => {
-                self.transition(&row.id, SessionState::Resuming, SessionState::Paused, None)?;
-                return Err(CliError::from(error).for_paused_session(&row.name, &row.model));
+                self.transition(&row.id, SessionState::Resuming, origin, None)?;
+                return Err(CliError::from(error).for_session_state(
+                    &row.name,
+                    &row.model,
+                    origin_label,
+                ));
             }
         };
         let attach = self
@@ -201,8 +334,8 @@ impl<E: Engine + 'static> Daemon<E> {
         let (engine, resolved, pid) = match attach {
             Ok(v) => v,
             Err(e) => {
-                self.transition(&row.id, SessionState::Resuming, SessionState::Paused, None)?;
-                return Err(e.for_paused_session(&row.name, &row.model));
+                self.transition(&row.id, SessionState::Resuming, origin, None)?;
+                return Err(e.for_session_state(&row.name, &row.model, origin_label));
             }
         };
         let prefill = {
@@ -214,8 +347,12 @@ impl<E: Engine + 'static> Daemon<E> {
             }
         };
         if let Err(error) = prefill {
-            self.transition(&row.id, SessionState::Resuming, SessionState::Paused, None)?;
-            return Err(map_engine_error(error).for_paused_session(&row.name, &row.model));
+            self.transition(&row.id, SessionState::Resuming, origin, None)?;
+            return Err(map_engine_error(error).for_session_state(
+                &row.name,
+                &row.model,
+                origin_label,
+            ));
         }
         if row.model_revision.is_none() {
             self.storage().set_resolved(

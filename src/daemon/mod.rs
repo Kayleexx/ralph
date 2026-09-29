@@ -18,6 +18,7 @@ use crate::state::{self, SessionState};
 use crate::storage::{SessionRow, Storage, StorageError};
 
 mod admission;
+mod idle;
 pub(crate) mod lifecycle;
 mod query;
 mod recovery;

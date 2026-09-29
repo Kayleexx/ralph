@@ -27,6 +27,9 @@ pub enum Request {
     Pause {
         session: String,
     },
+    Hibernate {
+        session: String,
+    },
     Resume {
         session: String,
         fast_only: bool,

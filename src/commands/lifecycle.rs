@@ -60,6 +60,39 @@ pub async fn run_pause(home: &Path, cli: Flags, session: String) -> i32 {
     }
 }
 
+pub async fn run_hibernate(home: &Path, cli: Flags, session: String) -> i32 {
+    let mut stream = match connect(home, cli).await {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    let request = Request::Hibernate { session };
+    let result = if !cli.json && !cli.quiet && std::io::stdout().is_terminal() {
+        send_with_progress(&mut stream, &request, "hibernating").await
+    } else {
+        client::send_request(&mut stream, &request).await
+    };
+    match result {
+        Ok(Response::Run(info)) => {
+            if cli.json {
+                print_json(&info);
+            } else if cli.quiet {
+                println!("{}", info.name);
+            } else {
+                println!(
+                    "{} {} hibernated",
+                    style(cli, "32", ok_mark(cli)),
+                    style(cli, "1", &info.name)
+                );
+                println!("{} ralph resume {}", arrow(cli), info.name);
+            }
+            0
+        }
+        Ok(Response::Error(payload)) => print_error(cli, &payload),
+        Ok(_) => print_protocol_error(cli),
+        Err(e) => print_io_error(cli, e),
+    }
+}
+
 pub async fn run_resume(
     home: &Path,
     cli: Flags,

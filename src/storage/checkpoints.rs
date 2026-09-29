@@ -45,6 +45,34 @@ impl Storage {
             .map_err(StorageError::from)
     }
 
+    /// Oldest first, for quota eviction (`daemon::lifecycle::enforce_kv_quota`).
+    pub fn list_checkpoints(&self) -> Result<Vec<CheckpointRow>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT session_id, fingerprint, kv_dir, engine_id, created_at
+             FROM checkpoints ORDER BY created_at ASC",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(CheckpointRow {
+                    session_id: r.get(0)?,
+                    fingerprint_json: r.get(1)?,
+                    kv_dir: r.get(2)?,
+                    engine_id: r.get(3)?,
+                    created_at: r.get(4)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn delete_checkpoint(&self, session_id: &str) -> Result<(), StorageError> {
+        self.conn.execute(
+            "DELETE FROM checkpoints WHERE session_id = ?1",
+            [session_id],
+        )?;
+        Ok(())
+    }
+
     pub fn upsert_checkpoint(&self, row: &CheckpointRow) -> Result<(), StorageError> {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
@@ -104,5 +132,34 @@ mod tests {
         updated.kv_dir = "/tmp/kv2".to_string();
         storage.upsert_checkpoint(&updated).unwrap();
         assert_eq!(storage.get_checkpoint("s").unwrap(), Some(updated));
+    }
+
+    #[test]
+    fn list_checkpoints_is_ordered_oldest_first() {
+        let storage = Storage::open_in_memory().unwrap();
+        let mut a = sample("a");
+        a.created_at = "2020-01-02T00:00:00Z".into();
+        let mut b = sample("b");
+        b.created_at = "2020-01-01T00:00:00Z".into();
+        storage.upsert_checkpoint(&a).unwrap();
+        storage.upsert_checkpoint(&b).unwrap();
+        let listed = storage.list_checkpoints().unwrap();
+        assert_eq!(
+            listed
+                .iter()
+                .map(|r| r.session_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["b", "a"]
+        );
+    }
+
+    #[test]
+    fn delete_checkpoint_removes_only_that_row() {
+        let storage = Storage::open_in_memory().unwrap();
+        storage.upsert_checkpoint(&sample("a")).unwrap();
+        storage.upsert_checkpoint(&sample("b")).unwrap();
+        storage.delete_checkpoint("a").unwrap();
+        assert_eq!(storage.get_checkpoint("a").unwrap(), None);
+        assert!(storage.get_checkpoint("b").unwrap().is_some());
     }
 }

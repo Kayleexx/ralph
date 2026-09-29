@@ -50,6 +50,7 @@ pub async fn run_daemon<E: Engine + 'static>(
     daemon
         .reconcile_on_startup()
         .map_err(std::io::Error::other)?;
+    daemon.spawn_idle_sweep();
 
     let listener = UnixListener::bind(&socket_path)?;
     loop {
@@ -98,6 +99,12 @@ async fn handle_connection<E: Engine + 'static>(
         ipc::Request::Pause { session } => {
             lifecycle(&mut stream, Response::Run, |cancel| {
                 daemon.pause_cancellable(&session, Some(cancel))
+            })
+            .await
+        }
+        ipc::Request::Hibernate { session } => {
+            lifecycle(&mut stream, Response::Run, |cancel| {
+                daemon.hibernate_cancellable(&session, Some(cancel))
             })
             .await
         }

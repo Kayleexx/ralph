@@ -38,6 +38,9 @@ impl<E: Engine + 'static> Daemon<E> {
         let profile = entry.profile;
 
         drop(workers);
+        // Marks real query activity for the idle-hibernate sweep (`daemon::idle`),
+        // distinct from state-transition timestamps.
+        self.storage().touch(&row.id, &now_rfc3339())?;
         self.wake_worker(&engine, profile).await?;
 
         let mut messages = self.storage().replay_turns(&row.id)?;

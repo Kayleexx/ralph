@@ -132,6 +132,112 @@ async fn concurrent_resume_on_the_same_session_serializes() {
 }
 
 #[tokio::test]
+async fn hibernate_then_resume_round_trips_back_to_active() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = test_daemon(dir.path());
+    daemon
+        .run("model".to_string(), Some("demo".to_string()))
+        .await
+        .unwrap();
+
+    let hibernated = daemon.hibernate_cancellable("demo", None).await.unwrap();
+    assert_eq!(hibernated.state, "hibernated");
+    assert!(daemon.workers.lock().await.is_empty(), "GPU worker freed");
+
+    let resumed = daemon
+        .resume_cancellable("demo", ResumeMode::Auto, None)
+        .await
+        .unwrap();
+    assert_eq!(resumed.session.state, "active");
+}
+
+/// Unlike pause, a checkpoint write failure must not block hibernation — §16.7
+/// "Hibernation cannot save acceleration state" explicitly allows logical-only.
+#[tokio::test]
+async fn hibernate_succeeds_even_when_the_checkpoint_write_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = test_daemon(dir.path());
+    daemon
+        .run("model".to_string(), Some("demo".to_string()))
+        .await
+        .unwrap();
+    daemon.inject_storage_fault("DROP TABLE checkpoints");
+
+    let hibernated = daemon.hibernate_cancellable("demo", None).await.unwrap();
+    assert_eq!(hibernated.state, "hibernated");
+}
+
+#[tokio::test]
+async fn enforce_kv_quota_evicts_oldest_other_sessions_first() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = test_daemon(dir.path());
+    let write_checkpoint = |session_id: &str, created_at: &str, bytes: usize| {
+        let kv_dir = dir.path().join("sessions").join(session_id).join("kvcache");
+        std::fs::create_dir_all(&kv_dir).unwrap();
+        std::fs::write(kv_dir.join("block.bin"), vec![0u8; bytes]).unwrap();
+        daemon
+            .storage()
+            .upsert_checkpoint(&crate::storage::checkpoints::CheckpointRow {
+                session_id: session_id.to_string(),
+                fingerprint_json: "{}".to_string(),
+                kv_dir: kv_dir.to_string_lossy().into_owned(),
+                engine_id: format!("ralph-{session_id}"),
+                created_at: created_at.to_string(),
+            })
+            .unwrap();
+        kv_dir
+    };
+    let oldest = write_checkpoint("old", "2020-01-01T00:00:00Z", 3 * 1024);
+    write_checkpoint("new", "2020-01-02T00:00:00Z", 3 * 1024);
+
+    daemon.enforce_kv_quota_within("new", 4 * 1024);
+
+    assert!(!oldest.exists(), "oldest checkpoint is evicted over quota");
+    assert!(daemon.storage().get_checkpoint("old").unwrap().is_none());
+    assert!(daemon.storage().get_checkpoint("new").unwrap().is_some());
+}
+
+/// A stale `Recovering` session for the same model (crashed earlier, never explicitly
+/// `ralph recover`ed) must never count as "still needs this worker" — regression test
+/// for a real bug found via manual CLI testing: `attach_or_start_worker`'s cold start
+/// used to opportunistically glue every same-model `Recovering` session onto the fresh
+/// worker's `session_ids`, so `hibernate`/`pause` could never see the count reach zero
+/// and silently left the GPU worker running forever.
+#[tokio::test]
+async fn hibernate_releases_the_worker_despite_an_unrelated_recovering_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = test_daemon(dir.path());
+    daemon
+        .run("shared-model".to_string(), Some("stale".to_string()))
+        .await
+        .unwrap();
+    let stale = daemon.inspect("stale").unwrap().session;
+    daemon
+        .transition(
+            &stale.id,
+            SessionState::Active,
+            SessionState::Recovering,
+            None,
+        )
+        .unwrap();
+    {
+        let mut workers = daemon.workers.lock().await;
+        workers.remove("shared-model");
+    }
+
+    daemon
+        .run("shared-model".to_string(), Some("newt".to_string()))
+        .await
+        .unwrap();
+    let hibernated = daemon.hibernate_cancellable("newt", None).await.unwrap();
+    assert_eq!(hibernated.state, "hibernated");
+    assert!(
+        daemon.workers.lock().await.is_empty(),
+        "worker must be freed: newt was the only session actually attached"
+    );
+}
+
+#[tokio::test]
 async fn pause_on_a_non_active_session_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let daemon = test_daemon(dir.path());

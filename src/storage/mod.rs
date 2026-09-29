@@ -229,6 +229,16 @@ impl Storage {
         Ok(())
     }
 
+    /// Bumps only `updated_at`, so per-session idle tracking (`daemon::idle`) reflects
+    /// real query activity, not just state transitions.
+    pub fn touch(&self, id: &str, updated_at: &str) -> Result<(), StorageError> {
+        self.conn.execute(
+            "UPDATE sessions SET updated_at = ?1 WHERE id = ?2",
+            params![updated_at, id],
+        )?;
+        Ok(())
+    }
+
     pub fn list(&self) -> Result<Vec<SessionRow>, StorageError> {
         let mut stmt = self
             .conn

@@ -113,23 +113,6 @@ impl<E: Engine + 'static> Daemon<E> {
                 last_active: Instant::now(),
             },
         );
-        let recovering: Vec<_> = self
-            .storage()
-            .list()?
-            .into_iter()
-            .filter(|row| row.model == model && row.state == SessionState::Recovering)
-            .map(|row| row.id)
-            .collect();
-        {
-            let mut workers = self.workers.lock().await;
-            if let Some(entry) = workers.get_mut(model) {
-                for id in recovering {
-                    if !entry.session_ids.contains(&id) {
-                        entry.session_ids.push(id);
-                    }
-                }
-            }
-        }
         self.spawn_worker_supervisor(model.to_string(), handle.clone());
         Ok((handle, resolved, pid))
     }

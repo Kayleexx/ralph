@@ -187,6 +187,9 @@ impl Harness {
     pub fn pause(&self) -> Value {
         self.json(&["pause", SESSION])
     }
+    pub fn hibernate(&self) -> Value {
+        self.json(&["hibernate", SESSION])
+    }
     pub fn resume_json(&self, args: &[&str]) -> Output {
         self.command()
             .arg("--json")

@@ -71,6 +71,12 @@ pub enum Command {
         /// Session name, id, or a unique id prefix.
         session: String,
     },
+    /// A stronger pause: same GPU release, but best-effort if acceleration state can't
+    /// be saved
+    Hibernate {
+        /// Session name, id, or a unique id prefix.
+        session: String,
+    },
     /// Reattach a paused session, fast (native KV) if a compatible checkpoint exists
     Resume {
         /// Session name, id, or a unique id prefix.

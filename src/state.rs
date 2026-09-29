@@ -15,7 +15,7 @@ pub enum SessionState {
     Pausing,
     Paused,
     Resuming,
-    /// Reserved for hibernation; currently unreachable.
+    Hibernating,
     Hibernated,
     /// Worker loss or an explicit recovery attempt.
     Recovering,
@@ -33,6 +33,7 @@ impl SessionState {
         SessionState::Pausing,
         SessionState::Paused,
         SessionState::Resuming,
+        SessionState::Hibernating,
         SessionState::Hibernated,
         SessionState::Recovering,
         SessionState::Moving,
@@ -48,6 +49,7 @@ impl SessionState {
             SessionState::Pausing => "pausing",
             SessionState::Paused => "paused",
             SessionState::Resuming => "resuming",
+            SessionState::Hibernating => "hibernating",
             SessionState::Hibernated => "hibernated",
             SessionState::Recovering => "recovering",
             SessionState::Moving => "moving",
@@ -125,6 +127,13 @@ pub fn validate_transition(from: SessionState, to: SessionState) -> Result<(), S
         // resume failed (worker admission, prefill, ...); durable state is untouched, so
         // the session stays Paused rather than landing in a new, unreachable state.
         (Resuming, Paused) => Ok(()),
+        // `ralph hibernate`, or the daemon's own idle sweep: same shape as pause, but
+        // best-effort — see `daemon::lifecycle::hibernate_cancellable`.
+        (Active, Hibernating) => Ok(()),
+        (Hibernating, Hibernated) => Ok(()),
+        (Hibernating, Active) => Ok(()),
+        (Hibernated, Resuming) => Ok(()),
+        (Resuming, Hibernated) => Ok(()),
         (from, to) => Err(StateError { from, to }),
     }
 }
@@ -180,6 +189,16 @@ mod tests {
         assert!(validate_transition(SessionState::Active, SessionState::Paused).is_err());
         assert!(validate_transition(SessionState::Paused, SessionState::Active).is_err());
         assert!(validate_transition(SessionState::Active, SessionState::Hibernated).is_err());
+        assert!(validate_transition(SessionState::Hibernated, SessionState::Active).is_err());
+    }
+
+    #[test]
+    fn hibernate_and_resume_transitions_succeed() {
+        assert!(validate_transition(SessionState::Active, SessionState::Hibernating).is_ok());
+        assert!(validate_transition(SessionState::Hibernating, SessionState::Hibernated).is_ok());
+        assert!(validate_transition(SessionState::Hibernating, SessionState::Active).is_ok());
+        assert!(validate_transition(SessionState::Hibernated, SessionState::Resuming).is_ok());
+        assert!(validate_transition(SessionState::Resuming, SessionState::Hibernated).is_ok());
     }
 
     #[test]
