@@ -371,6 +371,14 @@ pub(crate) async fn cancelled(cancel: &mut Option<tokio::sync::oneshot::Receiver
     }
 }
 
+/// True when a request to the worker failed because the process itself is gone
+/// (connection refused), not because of a slow response or a bad one — the crash
+/// supervisor polls every 500ms, so a query issued in that same window can reach a
+/// dead worker before the supervisor has even noticed.
+pub(crate) fn worker_unreachable(e: &EngineError) -> bool {
+    matches!(e, EngineError::Request(req) if req.is_connect())
+}
+
 pub(crate) fn map_engine_error(e: EngineError) -> CliError {
     match e {
         EngineError::Startup {

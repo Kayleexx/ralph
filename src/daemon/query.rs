@@ -108,12 +108,23 @@ impl<E: Engine + 'static> Daemon<E> {
             role: crate::engine::Role::User,
             content: prompt.into(),
         });
-        let tokenized = engine
-            .lock()
-            .await
-            .tokenize(&messages)
-            .await
-            .map_err(map_engine_error)?;
+        let tokenized = match engine.lock().await.tokenize(&messages).await {
+            Ok(t) => t,
+            Err(error) if worker_unreachable(&error) => {
+                // The crash supervisor hasn't polled yet (up to 500ms lag) — this
+                // query found the dead worker first. Land the same place the
+                // supervisor would, as `Busy` so the caller retries through
+                // `ensure_ready` instead of surfacing a raw connection error.
+                let _ = self.transition(
+                    &row.id,
+                    SessionState::Active,
+                    SessionState::Recovering,
+                    None,
+                );
+                return Err(CliError::Busy("worker crashed; recovering".into()));
+            }
+            Err(error) => return Err(map_engine_error(error)),
+        };
         if tokenized.ids.len() >= tokenized.limit as usize {
             return Err(CliError::Usage(format!(
                 "complete chat context needs {} tokens; model limit is {} tokens (request was not accepted)",

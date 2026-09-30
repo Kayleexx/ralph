@@ -31,7 +31,7 @@ fn recover_ready(h: &Harness, session: &str) -> Value {
             result = Some(value);
             return true;
         }
-        assert_eq!(output.status.code(), Some(6), "{value}");
+        assert_eq!(output.status.code(), Some(4), "{value}");
         assert!(
             value["error"]["summary"]
                 .as_str()
@@ -114,7 +114,7 @@ async fn two_qwen_workers_admission_recovery_and_reconciliation() {
         h.worker().is_some()
     });
     let second = h.output(&["--json", "run", MODEL, "--name", "same-model"]);
-    assert_eq!(second.status.code(), Some(6));
+    assert_eq!(second.status.code(), Some(4));
     assert_eq!(h.worker_records().len(), 1);
     let first_output = first.wait_with_output().unwrap();
     assert!(

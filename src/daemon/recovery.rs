@@ -147,7 +147,10 @@ impl<E: Engine + 'static> Daemon<E> {
                 ));
             }
             if engine_handle.lock().await.try_wait_for_exit().is_some() {
-                return Err(CliError::Resource(
+                // The crash supervisor hasn't polled and cleaned up this dead entry
+                // yet (up to 500ms lag) — retry-safe like the startup lock case, not
+                // a real failure, so callers must not treat it as terminal either.
+                return Err(CliError::Busy(
                     "worker exited; session preserved, retry after crash detection".into(),
                 ));
             }

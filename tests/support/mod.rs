@@ -140,9 +140,8 @@ impl Harness {
                 recovered = Some(value);
                 return true;
             }
-            assert_eq!(
-                output.status.code(),
-                Some(6),
+            assert!(
+                matches!(output.status.code(), Some(4) | Some(6)),
                 "unexpected recovery failure: {value}"
             );
             false

@@ -78,7 +78,17 @@ pub(super) async fn handle_query<E: Engine + 'static>(
     if let Err(e) = ensure_ready(daemon, stream, session).await {
         return send_result(stream, Err(e)).await;
     }
-    let running = match daemon.begin_query(session, prompt).await {
+    let mut attempt = daemon.begin_query(session, prompt).await;
+    // `begin_query` can discover the worker just died (racing the crash
+    // supervisor's poll) after `ensure_ready` already found it active — one more
+    // `ensure_ready` now that the session is correctly `Recovering` closes that gap.
+    if matches!(&attempt, Err(CliError::Busy(_))) {
+        if let Err(e) = ensure_ready(daemon, stream, session).await {
+            return send_result(stream, Err(e)).await;
+        }
+        attempt = daemon.begin_query(session, prompt).await;
+    }
+    let running = match attempt {
         Ok(r) => r,
         Err(e) => return send_result(stream, Err(e)).await,
     };
