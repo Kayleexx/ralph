@@ -3,7 +3,9 @@
 mod generation;
 mod handoff;
 mod lifecycle;
+mod migrate;
 mod portable;
+mod status;
 use std::io::{IsTerminal, Read, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -37,10 +39,11 @@ pub(crate) fn style(cli: Flags, code: &str, text: &str) -> String {
 }
 
 /// `model@revision` when a real, distinct revision is known; otherwise just the model id
-/// — never a fake revision equal to the model id itself.
+/// — never a fake revision equal to the model id itself. Shown abbreviated (first 8
+/// chars, matching a short git SHA) — the full revision is always in `--json`.
 pub(crate) fn format_model_ref(model: &str, revision: Option<&str>) -> String {
     match revision {
-        Some(rev) => format!("{model}@{rev}"),
+        Some(rev) => format!("{model}@{}", rev.chars().take(8).collect::<String>()),
         None => model.to_string(),
     }
 }
@@ -197,7 +200,15 @@ async fn send_with_progress(
     result
 }
 
-pub async fn run_run(home: &Path, cli: Flags, model: Option<String>, name: Option<String>) -> i32 {
+pub async fn run_run(
+    home: &Path,
+    cli: Flags,
+    model: Option<String>,
+    name: Option<String>,
+    gpu: Option<u32>,
+    policy: Option<crate::continuity::ContinuityPolicy>,
+    continuity_target_ms: Option<u64>,
+) -> i32 {
     let (model, name) = match resolve_model_and_name(home, cli, model, name).await {
         Ok(pair) => pair,
         Err(code) => return code,
@@ -206,7 +217,13 @@ pub async fn run_run(home: &Path, cli: Flags, model: Option<String>, name: Optio
         Ok(s) => s,
         Err(code) => return code,
     };
-    let request = Request::Run { model, name };
+    let request = Request::Run {
+        model,
+        name,
+        gpu,
+        policy,
+        continuity_target_ms,
+    };
     let show_progress = !cli.json && !cli.quiet && std::io::stdout().is_terminal();
     let result = if show_progress {
         send_with_progress(&mut stream, &request, "starting").await
@@ -220,6 +237,9 @@ pub async fn run_run(home: &Path, cli: Flags, model: Option<String>, name: Optio
             } else if cli.quiet {
                 println!("{}", info.name);
             } else {
+                if let Some(demoted) = &info.made_room_for {
+                    println!("making room \u{2014} hibernated {demoted}");
+                }
                 println!(
                     "{} {} ready",
                     style(cli, "32", ok_mark(cli)),
@@ -241,118 +261,10 @@ pub async fn run_run(home: &Path, cli: Flags, model: Option<String>, name: Optio
 pub use generation::{run_query, run_recover};
 pub use handoff::{run_drain, run_handoff};
 pub use lifecycle::{run_checkpoint, run_hibernate, run_pause, run_resume};
+pub use migrate::run_migrate;
 pub use portable::{run_export, run_import};
 
-pub async fn run_ps(home: &Path, cli: Flags) -> i32 {
-    let mut stream = match connect(home, cli).await {
-        Ok(s) => s,
-        Err(code) => return code,
-    };
-    match client::send_request(&mut stream, &Request::Ps).await {
-        Ok(Response::Ps(sessions)) => {
-            if cli.json {
-                print_json(&sessions);
-            } else if cli.quiet {
-                for s in &sessions {
-                    println!("{}", s.name);
-                }
-            } else if sessions.is_empty() {
-                println!(
-                    "no sessions yet\n\n{} ralph run <model> --name <name>",
-                    arrow(cli)
-                );
-            } else {
-                let header = format!(
-                    "{:<16} {:<24} {:>8} {:<10} LOCATION",
-                    "NAME", "MODEL", "TOKENS", "STATE"
-                );
-                println!("{}", style(cli, "2", &header));
-                for s in &sessions {
-                    println!(
-                        "{:<16} {:<24} {:>8} {:<10} {}",
-                        s.name,
-                        short_model_name(&s.model),
-                        s.token_count,
-                        s.state,
-                        s.location
-                    );
-                    if cli.verbose {
-                        println!(
-                            "  id: {}  pid: {}",
-                            s.id,
-                            s.pid
-                                .map(|p| p.to_string())
-                                .unwrap_or_else(|| "-".to_string())
-                        );
-                    }
-                }
-            }
-            0
-        }
-        Ok(Response::Error(payload)) => print_error(cli, &payload),
-        Ok(_) => print_protocol_error(cli),
-        Err(e) => print_io_error(cli, e),
-    }
-}
-
-pub async fn run_inspect(home: &Path, cli: Flags, session: String) -> i32 {
-    let mut stream = match connect(home, cli).await {
-        Ok(s) => s,
-        Err(code) => return code,
-    };
-    match client::send_request(&mut stream, &Request::Inspect { session }).await {
-        Ok(Response::Inspect(info)) => {
-            if cli.json {
-                print_json(&info);
-            } else if cli.quiet {
-                println!("{}", info.session.state);
-            } else {
-                println!("{} ({})", info.session.name, info.session.state);
-                println!(
-                    "  model: {}",
-                    format_model_ref(&info.session.model, info.session.model_revision.as_deref())
-                );
-                println!("  recoverability: {}", info.recoverability);
-                println!("  fast restore: {}", info.fast_restore);
-                println!("  portable state: {}", info.portable_state);
-                if let Some(destination) = info.moved_to {
-                    println!("  moved to: {destination}");
-                }
-                if let Some(failure) = info.last_failure {
-                    println!("  last worker failure: {failure}");
-                }
-            }
-            0
-        }
-        Ok(Response::Error(payload)) => print_error(cli, &payload),
-        Ok(_) => print_protocol_error(cli),
-        Err(e) => print_io_error(cli, e),
-    }
-}
-
-// Runs entirely in the CLI process rather than round-tripping through the daemon: doctor
-// exists to diagnose why the daemon/environment *isn't* working, so it must not depend on
-// the daemon being startable, and must not create the data directory as a side effect of
-// connecting to one.
-pub fn run_doctor(home: &Path, cli: Flags) -> i32 {
-    let checks = doctor::run_checks(home);
-    let any_fail = checks.iter().any(|c| c.status == "fail");
-    if cli.json {
-        print_json(&checks);
-    } else if cli.quiet {
-        println!("{}", if any_fail { "fail" } else { "pass" });
-    } else {
-        for check in &checks {
-            println!(
-                "{:<5} {:<16} {}",
-                check.status.to_uppercase(),
-                check.name,
-                check.detail
-            );
-        }
-    }
-    if any_fail { 6 } else { 0 }
-}
+pub use status::{run_doctor, run_inspect, run_ps};
 
 #[cfg(test)]
 mod tests {
@@ -371,6 +283,17 @@ mod tests {
         assert_eq!(
             format_model_ref("Qwen/Qwen2.5-0.5B-Instruct", Some("abc123")),
             "Qwen/Qwen2.5-0.5B-Instruct@abc123"
+        );
+    }
+
+    #[test]
+    fn format_model_ref_abbreviates_a_full_length_sha() {
+        assert_eq!(
+            format_model_ref(
+                "Qwen/Qwen2.5-0.5B-Instruct",
+                Some("7ae557604adf67be50417f59c2c2f167def9a775")
+            ),
+            "Qwen/Qwen2.5-0.5B-Instruct@7ae55760"
         );
     }
 

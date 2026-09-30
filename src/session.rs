@@ -70,6 +70,23 @@ pub fn session_dir(sessions_root: &Path, id: &str) -> PathBuf {
     sessions_root.join(id)
 }
 
+/// `"local/gpu{N}"` for GPU index `n` — the one place a `location` string is built from
+/// an index, so every write site stays consistent.
+pub fn location_for(gpu_index: u32) -> String {
+    format!("local/gpu{gpu_index}")
+}
+
+/// The inverse of `location_for`: `0` for anything that doesn't parse (including the
+/// pre-existing bare `"local/gpu0"` literal), never a hard failure — GPU placement is
+/// advisory bookkeeping, not a correctness invariant.
+pub fn gpu_index_of(location: &str) -> u32 {
+    location
+        .rsplit("gpu")
+        .next()
+        .and_then(|suffix| suffix.parse().ok())
+        .unwrap_or(0)
+}
+
 /// Creates the session directory (mode 0700) and writes manifest.json (mode 0600) inside
 /// it. Session artifacts are private by default since prompts may end up in vllm.log.
 pub fn create_session_dir(sessions_root: &Path, row: &SessionRow) -> io::Result<PathBuf> {
@@ -136,6 +153,8 @@ mod tests {
             token_count: 0,
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
+            continuity_policy: crate::continuity::ContinuityPolicy::default(),
+            continuity_target_ms: None,
         }
     }
 

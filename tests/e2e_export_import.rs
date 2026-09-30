@@ -24,7 +24,7 @@ fn export_import_round_trip_with_and_without_accel() {
     h.json(&[
         "query",
         SESSION,
-        "Remember the secret word guava. Reply with that word only.",
+        "Remember the secret word papaya. Reply with that word only.",
     ]);
     h.checkpoint();
 
@@ -33,13 +33,13 @@ fn export_import_round_trip_with_and_without_accel() {
     let with_accel = h.home.path().join("with-accel.ralph");
     let exported = h.export(&with_accel, true);
     assert_eq!(exported["session"]["name"], SESSION);
-    let imported = h.import(&with_accel, "guava-copy");
+    let imported = h.import(&with_accel, "papaya-copy");
     assert_eq!(imported["state"], "paused");
 
-    let resumed = h.resume_named("guava-copy");
+    let resumed = h.resume_named("papaya-copy");
     assert_eq!(resumed["session"]["state"], "active");
     let reply = h.query_named(
-        "guava-copy",
+        "papaya-copy",
         "What secret word did I ask you to remember? One word only.",
     );
     assert!(
@@ -47,16 +47,16 @@ fn export_import_round_trip_with_and_without_accel() {
             .as_str()
             .unwrap()
             .to_lowercase()
-            .contains("guava"),
+            .contains("papaya"),
         "context lost across export/import: {reply}"
     );
 
     // Without accel: nothing to carry natively, so resume must honestly report portable.
     let without_accel = h.home.path().join("without-accel.ralph");
     h.export(&without_accel, false);
-    let imported2 = h.import(&without_accel, "guava-copy-2");
+    let imported2 = h.import(&without_accel, "papaya-copy-2");
     assert_eq!(imported2["state"], "paused");
-    let resumed2 = h.resume_named("guava-copy-2");
+    let resumed2 = h.resume_named("papaya-copy-2");
     assert_eq!(
         resumed2["native"], false,
         "no accel was exported: {resumed2}"

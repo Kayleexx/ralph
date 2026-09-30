@@ -1,9 +1,9 @@
 //! `ralph handoff`: moves a session's ownership to another Ralph installation over SSH.
-//! Composes Phase 5's archive format/import path with an explicit two-phase commit —
+//! Composes the existing archive format/import path with an explicit two-phase commit —
 //! the destination's ACK (a successful `__handoff-recv`) is the only thing that ever
 //! flips this session's state to `Moved` (`crate::state`), so a killed connection,
 //! SSH auth failure, or destination rejection always leaves the source unchanged and
-//! recoverable (RALPH_SPEC.md §16.9 split-brain prevention).
+//! recoverable — never two machines both thinking they own the session.
 use std::process::Stdio;
 use std::sync::Arc;
 
@@ -22,8 +22,9 @@ use crate::storage::SessionRow;
 use crate::storage::handoff::HandoffRow;
 
 /// Headroom over the archive's own byte length required on the destination before a
-/// transfer is attempted — a coarse preflight, not a guarantee (§16.9 "destination
-/// lacks disk space... fail before transfer or before commit").
+/// transfer is attempted — a coarse preflight, not a guarantee: a destination low on
+/// disk space should fail before transfer, or at worst before commit, not partway
+/// through leaving an orphaned partial archive.
 const DISK_HEADROOM_FACTOR: u64 = 2;
 
 #[derive(Debug, Deserialize)]
@@ -69,7 +70,13 @@ async fn run_ssh(
         .map_err(|e| CliError::Other(anyhow::anyhow!("cannot run ssh: {e}")))?;
 
     if let Some(bytes) = stdin_bytes {
-        let mut stdin = child.stdin.take().expect("stdin is piped above");
+        let Some(mut stdin) = child.stdin.take() else {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            return Err(CliError::Other(anyhow::anyhow!(
+                "ssh child has no stdin pipe; source session unchanged"
+            )));
+        };
         let write_and_close = async {
             stdin.write_all(bytes).await?;
             drop(stdin);
@@ -159,6 +166,12 @@ impl<E: Engine + 'static> Daemon<E> {
                 "session is {origin}, cannot hand it off"
             )));
         }
+        // Checked before touching local state at all: an unreachable destination or a
+        // protocol mismatch is knowable up front, so it should never cost the caller
+        // their live worker — only the disk-space preflight has to wait for the worker
+        // to actually be released (it needs the archive's real, post-release size).
+        let probe = self.probe_destination(destination, &mut cancel).await?;
+
         self.transition(&row.id, origin, SessionState::Moving, None)?;
 
         let mut worker_released = false;
@@ -184,7 +197,7 @@ impl<E: Engine + 'static> Daemon<E> {
 
         let remote_name = name.unwrap_or_else(|| row.name.clone());
         if let Err(e) = self
-            .attempt_handoff(&row, destination, &remote_name, &mut cancel)
+            .attempt_handoff(&row, destination, &remote_name, &probe, &mut cancel)
             .await
         {
             self.transition(&row.id, SessionState::Moving, rollback_to, None)?;
@@ -201,16 +214,17 @@ impl<E: Engine + 'static> Daemon<E> {
         Ok(to_session_info(&self.storage().resolve(&row.id)?))
     }
 
-    async fn attempt_handoff(
+    /// Reachability + protocol-version check only — deliberately callable before the
+    /// local worker is ever released, so a destination that's unreachable from the
+    /// start never costs the caller their live session (see `handoff_cancellable`).
+    /// The disk-space check is the one preflight step that must wait: it needs the
+    /// archive's real byte length, which itself needs a stable (released) KV directory.
+    async fn probe_destination(
         &self,
-        row: &SessionRow,
         destination: &str,
-        remote_name: &str,
         cancel: &mut Option<oneshot::Receiver<()>>,
-    ) -> Result<(), CliError> {
-        let archive = self.build_export_archive(row, true)?;
+    ) -> Result<ProbeInfo, CliError> {
         let ssh_program = self.ssh_program();
-
         let probe_output = run_ssh(
             &ssh_program,
             destination,
@@ -234,6 +248,19 @@ impl<E: Engine + 'static> Daemon<E> {
                 portable::FORMAT_VERSION
             )));
         }
+        Ok(probe)
+    }
+
+    async fn attempt_handoff(
+        &self,
+        row: &SessionRow,
+        destination: &str,
+        remote_name: &str,
+        probe: &ProbeInfo,
+        cancel: &mut Option<oneshot::Receiver<()>>,
+    ) -> Result<(), CliError> {
+        let archive = self.build_export_archive(row, true)?;
+        let ssh_program = self.ssh_program();
         let required = (archive.len() as u64).saturating_mul(DISK_HEADROOM_FACTOR);
         if probe.disk_free_bytes < required {
             return Err(CliError::Resource(format!(

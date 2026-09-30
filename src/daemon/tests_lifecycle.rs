@@ -39,7 +39,7 @@ async fn resuming_an_already_active_session_is_a_noop() {
 
 /// `pause` always records a checkpoint pointer, so the only way `--fast-only` sees "no
 /// compatible checkpoint" is a fingerprint that no longer matches (moved model revision,
-/// different engine, ...) — never trust a stale pointer (Invariant 3).
+/// different engine, ...) — never trust a stale pointer.
 #[tokio::test]
 async fn resume_fast_only_with_an_incompatible_fingerprint_fails_clearly_and_stays_paused() {
     let dir = tempfile::tempdir().unwrap();
@@ -80,7 +80,11 @@ async fn pausing_one_of_two_sessions_sharing_a_worker_keeps_the_other_active() {
     assert_eq!(daemon.inspect("a").unwrap().session.state, "paused");
     assert_eq!(daemon.inspect("b").unwrap().session.state, "active");
     assert!(
-        daemon.workers.lock().await.contains_key("shared-model"),
+        daemon
+            .workers
+            .lock()
+            .await
+            .contains_key(&wk("shared-model")),
         "worker must stay up for the still-active session"
     );
 
@@ -92,7 +96,7 @@ async fn pausing_one_of_two_sessions_sharing_a_worker_keeps_the_other_active() {
 }
 
 /// Two concurrent `resume` calls on the same session must have clearly defined behavior
-/// (per-session lock, RALPH_SPEC.md §16.7): exactly one proceeds, the other fails fast
+/// (per-session lock): exactly one proceeds, the other fails fast
 /// with a clear "already in progress" rather than racing the state machine.
 #[tokio::test]
 async fn concurrent_resume_on_the_same_session_serializes() {
@@ -110,6 +114,48 @@ async fn concurrent_resume_on_the_same_session_serializes() {
     );
     assert!(a.is_ok() ^ b.is_ok(), "exactly one resume wins the lock");
     assert_eq!(daemon.inspect("demo").unwrap().session.state, "active");
+}
+
+/// Same lock, different transient state per op — exactly one of pause/hibernate must
+/// win when both race the same active session.
+#[tokio::test]
+async fn concurrent_pause_and_hibernate_on_the_same_session_serializes() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = test_daemon(dir.path());
+    daemon
+        .run("model".to_string(), Some("demo".to_string()))
+        .await
+        .unwrap();
+
+    let (a, b) = tokio::join!(
+        daemon.pause_cancellable("demo", None),
+        daemon.hibernate_cancellable("demo", None)
+    );
+    assert!(a.is_ok() ^ b.is_ok(), "exactly one op wins the lock");
+    let state = daemon.inspect("demo").unwrap().session.state;
+    assert!(state == "paused" || state == "hibernated");
+}
+
+/// A session mid-`Moving` must stay opaque to concurrent local lifecycle ops — no
+/// split-brain where one op thinks the session moved and another thinks it's live.
+#[tokio::test]
+async fn concurrent_recover_and_pause_on_a_moving_session_both_fail_cleanly() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = test_daemon(dir.path());
+    let info = daemon
+        .run("model".to_string(), Some("demo".to_string()))
+        .await
+        .unwrap();
+    daemon
+        .transition(&info.id, SessionState::Active, SessionState::Moving, None)
+        .unwrap();
+
+    let (a, b) = tokio::join!(
+        daemon.recover_cancellable("demo", None),
+        daemon.pause_cancellable("demo", None)
+    );
+    assert!(a.is_err() && b.is_err(), "neither op applies mid-move");
+    assert_eq!(daemon.inspect("demo").unwrap().session.state, "moving");
 }
 
 #[tokio::test]
@@ -157,7 +203,7 @@ async fn hibernate_releases_the_worker_despite_an_unrelated_recovering_session()
         .unwrap();
     {
         let mut workers = daemon.workers.lock().await;
-        workers.remove("shared-model");
+        workers.remove(&wk("shared-model"));
     }
 
     daemon

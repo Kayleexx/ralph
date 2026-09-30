@@ -33,11 +33,13 @@ pub async fn run_pause(home: &Path, cli: Flags, session: String) -> i32 {
         Err(code) => return code,
     };
     let request = Request::Pause { session };
+    let start = Instant::now();
     let result = if !cli.json && !cli.quiet && std::io::stdout().is_terminal() {
         send_with_progress(&mut stream, &request, "pausing").await
     } else {
         client::send_request(&mut stream, &request).await
     };
+    let elapsed = start.elapsed();
     match result {
         Ok(Response::Run(info)) => {
             if cli.json {
@@ -46,9 +48,10 @@ pub async fn run_pause(home: &Path, cli: Flags, session: String) -> i32 {
                 println!("{}", info.name);
             } else {
                 println!(
-                    "{} {} paused",
+                    "{} {} paused in {:.1}s",
                     style(cli, "32", ok_mark(cli)),
-                    style(cli, "1", &info.name)
+                    style(cli, "1", &info.name),
+                    elapsed.as_secs_f64()
                 );
                 println!("{} ralph resume {}", arrow(cli), info.name);
             }
@@ -66,11 +69,13 @@ pub async fn run_hibernate(home: &Path, cli: Flags, session: String) -> i32 {
         Err(code) => return code,
     };
     let request = Request::Hibernate { session };
+    let start = Instant::now();
     let result = if !cli.json && !cli.quiet && std::io::stdout().is_terminal() {
         send_with_progress(&mut stream, &request, "hibernating").await
     } else {
         client::send_request(&mut stream, &request).await
     };
+    let elapsed = start.elapsed();
     match result {
         Ok(Response::Run(info)) => {
             if cli.json {
@@ -79,9 +84,10 @@ pub async fn run_hibernate(home: &Path, cli: Flags, session: String) -> i32 {
                 println!("{}", info.name);
             } else {
                 println!(
-                    "{} {} hibernated",
+                    "{} {} hibernated in {:.1}s",
                     style(cli, "32", ok_mark(cli)),
-                    style(cli, "1", &info.name)
+                    style(cli, "1", &info.name),
+                    elapsed.as_secs_f64()
                 );
                 println!("{} ralph resume {}", arrow(cli), info.name);
             }
@@ -109,33 +115,42 @@ pub async fn run_resume(
         fast_only,
         portable,
     };
+    let start = Instant::now();
     let result = if !cli.json && !cli.quiet && std::io::stdout().is_terminal() {
         send_with_progress(&mut stream, &request, "resuming").await
     } else {
         client::send_request(&mut stream, &request).await
     };
+    let elapsed = start.elapsed();
     match result {
         Ok(Response::Resume(info)) => {
             if cli.json {
                 print_json(&info);
             } else if cli.quiet {
                 println!("{}", info.session.name);
-            } else if info.native {
-                println!("native checkpoint compatible");
+            } else if info.already_active {
                 println!(
-                    "{} restored {}",
+                    "{} {} already active",
                     style(cli, "32", ok_mark(cli)),
-                    style(cli, "1", &info.session.name)
+                    style(cli, "1", &info.session.name),
+                );
+            } else if info.native {
+                println!(
+                    "{} {} resumed from KV checkpoint in {:.1}s",
+                    style(cli, "32", ok_mark(cli)),
+                    style(cli, "1", &info.session.name),
+                    elapsed.as_secs_f64()
                 );
             } else {
                 println!(
-                    "native checkpoint unavailable; rehydrating from {} tokens...",
+                    "KV checkpoint incompatible; rebuilding from {} tokens...",
                     info.session.token_count
                 );
                 println!(
-                    "{} restored {}",
+                    "{} {} resumed in {:.1}s",
                     style(cli, "32", ok_mark(cli)),
-                    style(cli, "1", &info.session.name)
+                    style(cli, "1", &info.session.name),
+                    elapsed.as_secs_f64()
                 );
             }
             0

@@ -17,11 +17,11 @@ use crate::storage::SessionRow;
 use crate::storage::checkpoints::CheckpointRow;
 
 /// Coarse total across every session's KV directory combined — good enough to bound
-/// disk growth from accumulating checkpoints (§16.12) without per-model/per-user
-/// accounting no part of this codebase has today.
+/// disk growth from accumulating checkpoints without per-model/per-user accounting no
+/// part of this codebase has today.
 const KV_QUOTA_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
-fn dir_size(dir: &std::path::Path) -> u64 {
+pub(super) fn dir_size(dir: &std::path::Path) -> u64 {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return 0;
     };
@@ -45,15 +45,17 @@ impl<E: Engine + 'static> Daemon<E> {
             tokenizer_revision: row.tokenizer_revision.clone(),
             engine: row.engine.clone(),
             engine_version: row.engine_version.clone(),
-            gpu_name: (self.gpu_memory)().ok().map(|g| g.name),
+            gpu_name: (self.gpu_memory)(crate::session::gpu_index_of(&row.location))
+                .ok()
+                .map(|g| g.name),
             tensor_parallel: 1,
             adapter: None,
         }
     }
 
     /// Refuses to point a checkpoint at a filesystem that's already too full for vLLM's
-    /// offload connector to write into (§16.15 "fill checkpoint disk") — checked against
-    /// the session directory itself, not `kv_offload::has_room`'s target (which creates
+    /// offload connector to write into — checked against the session directory itself,
+    /// not `kv_offload::has_room`'s target (which creates
     /// the kvcache dir as a side effect and would prematurely materialize it before
     /// vLLM's connector ever attaches, breaking `export`'s "dir may not exist yet" check).
     pub(super) fn has_checkpoint_room(&self, row: &SessionRow) -> bool {
@@ -79,35 +81,75 @@ impl<E: Engine + 'static> Daemon<E> {
         }
     }
 
-    /// `None` unless a durably-recorded checkpoint exists whose fingerprint still matches
-    /// this session's current one, and there's enough disk headroom to justify attempting
-    /// it — never trusts vLLM's own directory-naming hash as the compatibility gate
-    /// (it omits model/tokenizer revision and engine version; see `crate::checkpoint`).
-    pub(super) fn kv_offload_for(&self, row: &SessionRow) -> Option<KvOffloadSpec> {
+    /// Why fast (native KV) resume is or isn't available right now.
+    pub(super) fn restore_readiness(
+        &self,
+        row: &SessionRow,
+    ) -> crate::checkpoint::RestoreReadiness {
+        use crate::checkpoint::{RestoreReadiness, classify};
+        let Ok(Some(checkpoint)) = self.storage().get_checkpoint(&row.id) else {
+            return RestoreReadiness::NoNativeState;
+        };
+        let Some(stored) = Fingerprint::from_json(&checkpoint.fingerprint_json) else {
+            return RestoreReadiness::NoNativeState;
+        };
+        let dir = std::path::PathBuf::from(&checkpoint.kv_dir);
+        let room_ok = kv_offload::has_room(&dir, kv_offload::DEFAULT_CPU_BYTES);
+        let content_intact = kv_offload::content_signature_intact(&dir);
+        classify(
+            &self.current_fingerprint(row),
+            Some(&stored),
+            content_intact,
+            room_ok,
+        )
+    }
+
+    /// (field, current, stored) triples that differ, for `--verbose` inspect — never
+    /// turn/prompt content, only fingerprint fields.
+    pub(super) fn fingerprint_diff(
+        &self,
+        row: &SessionRow,
+    ) -> Option<Vec<(String, String, String)>> {
         let checkpoint = self.storage().get_checkpoint(&row.id).ok().flatten()?;
         let stored = Fingerprint::from_json(&checkpoint.fingerprint_json)?;
-        if stored != self.current_fingerprint(row) {
+        let current = self.current_fingerprint(row);
+        let mut diff = Vec::new();
+        macro_rules! field {
+            ($name:literal, $accessor:ident) => {
+                if current.$accessor != stored.$accessor {
+                    diff.push((
+                        $name.to_string(),
+                        format!("{:?}", current.$accessor),
+                        format!("{:?}", stored.$accessor),
+                    ));
+                }
+            };
+        }
+        field!("model_revision", model_revision);
+        field!("tokenizer_revision", tokenizer_revision);
+        field!("engine", engine);
+        field!("engine_version", engine_version);
+        field!("gpu_name", gpu_name);
+        Some(diff)
+    }
+
+    /// `None` unless `restore_readiness` reports the checkpoint is actually usable.
+    pub(super) fn kv_offload_for(&self, row: &SessionRow) -> Option<KvOffloadSpec> {
+        if self.restore_readiness(row) != crate::checkpoint::RestoreReadiness::NativeAvailable {
             return None;
         }
-        let dir = std::path::PathBuf::from(&checkpoint.kv_dir);
-        if !kv_offload::has_room(&dir, kv_offload::DEFAULT_CPU_BYTES) {
-            return None;
-        }
-        if !kv_offload::content_signature_intact(&dir) {
-            return None;
-        }
+        let checkpoint = self.storage().get_checkpoint(&row.id).ok().flatten()?;
         Some(KvOffloadSpec {
-            root_dir: dir,
+            root_dir: std::path::PathBuf::from(&checkpoint.kv_dir),
             cpu_bytes: kv_offload::DEFAULT_CPU_BYTES,
             engine_id: checkpoint.engine_id,
         })
     }
 
     /// Deletes the oldest *other* sessions' KV directories and checkpoint rows until the
-    /// combined total is back under budget (§16.12 "old acceleration snapshots
-    /// accumulate", §16.7 "NVMe tier full"). Only ever touches `checkpoints`/on-disk KV
+    /// combined total is back under budget. Only ever touches `checkpoints`/on-disk KV
     /// directories — never the durable `sessions`/`token_turns` tables, so eviction can
-    /// never make a session unrecoverable (Invariant 2).
+    /// never make a session unrecoverable.
     pub(super) fn enforce_kv_quota(&self, keep_session_id: &str) {
         self.enforce_kv_quota_within(keep_session_id, KV_QUOTA_BYTES);
     }
@@ -135,9 +177,9 @@ impl<E: Engine + 'static> Daemon<E> {
         }
     }
 
-    /// Graceful SIGTERM preemption (RALPH_SPEC.md §6.11): one best-effort checkpoint
-    /// pass over every currently `Active` session before this process exits. Durable
-    /// token history is already flushed continuously (Phase 2), so this only improves
+    /// Graceful SIGTERM preemption: one best-effort checkpoint pass over every currently
+    /// `Active` session before this process exits. Durable token history is already
+    /// flushed continuously, so this only improves
     /// the odds of a *fast* resume elsewhere/after restart — the actual recovery path
     /// is the existing `reconcile_on_startup` → `ralph recover`/`ralph resume` story,
     /// unchanged. Never blocks on a fresh worker admission or state transition.

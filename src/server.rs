@@ -63,8 +63,8 @@ pub async fn run_daemon<E: Engine + 'static>(
     }
 }
 
-/// Graceful preemption (RALPH_SPEC.md §6.11): on SIGTERM, one best-effort checkpoint
-/// pass over every active session, then exit — stopping the process is what "stop
+/// Graceful preemption: on SIGTERM, one best-effort checkpoint pass over every active
+/// session, then exit — stopping the process is what "stop
 /// accepting new generation" means here, since every in-flight connection already
 /// handles a closed daemon socket the same safe way an ordinary crash does.
 fn spawn_sigterm_handler<E: Engine + 'static>(daemon: Arc<Daemon<E>>) {
@@ -88,9 +88,22 @@ async fn handle_connection<E: Engine + 'static>(
         return Ok(());
     };
     match request {
-        ipc::Request::Run { model, name } => {
+        ipc::Request::Run {
+            model,
+            name,
+            gpu,
+            policy,
+            continuity_target_ms,
+        } => {
             lifecycle(&mut stream, Response::Run, |cancel| {
-                daemon.run_cancellable(model, name, Some(cancel))
+                daemon.run_cancellable(
+                    model,
+                    name,
+                    gpu.unwrap_or(0),
+                    policy.unwrap_or_default(),
+                    continuity_target_ms.map(|ms| ms as i64),
+                    Some(cancel),
+                )
             })
             .await
         }
@@ -187,6 +200,12 @@ async fn handle_connection<E: Engine + 'static>(
         ipc::Request::Drain { location, to, yes } => {
             lifecycle(&mut stream, Response::Drain, |cancel| {
                 daemon.drain_cancellable(&location, to, yes, Some(cancel))
+            })
+            .await
+        }
+        ipc::Request::Migrate { session, to } => {
+            lifecycle(&mut stream, Response::Migrate, |cancel| {
+                daemon.migrate_cancellable(&session, to, Some(cancel))
             })
             .await
         }

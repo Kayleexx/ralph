@@ -98,6 +98,7 @@ impl Engine for VllmEngine {
         // full CUDA toolkit (nvcc) rather than just the driver — not something Ralph
         // should require on a workstation that only has the driver installed.
         cmd.env("RALPH_WORKER_OWNER", &nonce);
+        cmd.env("CUDA_VISIBLE_DEVICES", spec.gpu.to_string());
         // setproctitle otherwise overwrites /proc/environ and erases ownership markers.
         cmd.env("SPT_NOENV", "1");
         cmd.env("VLLM_USE_FLASHINFER_SAMPLER", "0");
@@ -114,22 +115,29 @@ impl Engine for VllmEngine {
         cmd.process_group(0);
         self.child = Some(cmd.spawn()?);
 
-        let pid = self
-            .child
-            .as_ref()
-            .and_then(|c| c.id())
-            .ok_or_else(|| EngineError::BadResponse("spawned worker has no PID".into()))?;
-        self.owned = Some(ownership::Ownership::new(
+        let Some(pid) = self.child.as_ref().and_then(|c| c.id()) else {
+            self.kill_unowned_spawn().await;
+            return Err(EngineError::BadResponse("spawned worker has no PID".into()));
+        };
+        let owned = match ownership::Ownership::new(
             pid,
             nonce,
             self.base_url.clone(),
             self.model.clone(),
             revision.clone(),
             spec.profile,
-        )?);
-        if let Some(owned) = &self.owned {
-            owned.save(&self.log_path.with_file_name("worker.json"))?;
+        ) {
+            Ok(owned) => owned,
+            Err(error) => {
+                self.kill_unowned_spawn().await;
+                return Err(error.into());
+            }
+        };
+        if let Err(error) = owned.save(&self.log_path.with_file_name("worker.json")) {
+            self.kill_unowned_spawn().await;
+            return Err(error.into());
         }
+        self.owned = Some(owned);
         if let Err(error) = self.wait_until_healthy().await {
             let tail = diagnostics::tail(&self.log_path);
             let cause = diagnostics::cause(&tail).unwrap_or_else(|| error.to_string());
@@ -201,6 +209,10 @@ impl Engine for VllmEngine {
         })
     }
 
+    /// Always level 1: measured against real vLLM 0.30.0 on this profile (Qwen2.5-0.5B,
+    /// RTX 5050), level 2 freed identical VRAM (1339 MiB asleep, 2961 MiB awake) and had
+    /// identical wake-to-first-token latency (~50ms either way) — no measurable win to
+    /// justify the extra option.
     async fn sleep(&mut self) -> Result<(), EngineError> {
         let resp = self
             .client
@@ -296,6 +308,25 @@ impl Engine for VllmEngine {
 }
 
 impl VllmEngine {
+    /// Best-effort cleanup for a spawn that failed before an `Ownership` record could be
+    /// created/saved — `self.owned` isn't set yet, so `stop_model`'s normal group-kill
+    /// can't be used. `process_group(0)` still guarantees this pid is its own process
+    /// group leader, so killing `-<pid>` directly reaches any child (e.g. vLLM's own
+    /// EngineCore) it had already forked, not just the immediate process. Without this,
+    /// a failure in this narrow window leaks the real GPU process with no Ownership
+    /// record to ever find it again — reproduced live during heavy pause/resume cycling.
+    async fn kill_unowned_spawn(&mut self) {
+        if let Some(pid) = self.child.as_ref().and_then(|c| c.id()) {
+            let _ = std::process::Command::new("kill")
+                .args(["-KILL", "--", &format!("-{pid}")])
+                .status();
+        }
+        if let Some(child) = &mut self.child {
+            let _ = child.wait().await;
+        }
+        self.child = None;
+    }
+
     async fn wait_until_healthy(&mut self) -> Result<(), EngineError> {
         let deadline = Instant::now() + HEALTH_TIMEOUT;
         let last_reason = loop {

@@ -29,8 +29,13 @@ impl<E: Engine + 'static> Daemon<E> {
                 row.state
             )));
         }
+        let gpu_index = crate::session::gpu_index_of(&row.location);
+        let key = WorkerKey {
+            model: row.model.clone(),
+            gpu: gpu_index,
+        };
         let mut workers = self.workers.lock().await;
-        let entry = workers.get_mut(&row.model).ok_or_else(|| {
+        let entry = workers.get_mut(&key).ok_or_else(|| {
             CliError::InvalidState("worker is not running in this daemon".to_string())
         })?;
         entry.last_active = Instant::now();
@@ -41,7 +46,7 @@ impl<E: Engine + 'static> Daemon<E> {
         // Marks real query activity for the idle-hibernate sweep (`daemon::idle`),
         // distinct from state-transition timestamps.
         self.storage().touch(&row.id, &now_rfc3339())?;
-        self.wake_worker(&engine, profile).await?;
+        self.wake_worker(&engine, profile, gpu_index).await?;
 
         let mut messages = self.storage().replay_turns(&row.id)?;
         messages.push(ChatMessage {

@@ -140,3 +140,66 @@ impl Engine for FlakyNativeEngine {
         self.inner.pid()
     }
 }
+
+/// Fails startup on any GPU index other than 0 — models a destination GPU that's
+/// unreachable/unusable, so migration rollback can be tested deterministically without
+/// real second-GPU hardware.
+pub(super) struct GpuBoundEngine {
+    inner: FakeEngine,
+}
+
+impl GpuBoundEngine {
+    pub(crate) fn new(log_path: PathBuf) -> Self {
+        GpuBoundEngine {
+            inner: FakeEngine::new(log_path),
+        }
+    }
+}
+
+impl Engine for GpuBoundEngine {
+    async fn start_model(&mut self, spec: &ModelSpec) -> Result<ResolvedModel, EngineError> {
+        if spec.gpu != 0 {
+            return Err(EngineError::BadResponse(format!(
+                "gpu{} unreachable",
+                spec.gpu
+            )));
+        }
+        self.inner.start_model(spec).await
+    }
+    async fn health(&self) -> HealthStatus {
+        self.inner.health().await
+    }
+    async fn generate(&self, messages: &[ChatMessage]) -> Result<GenerationHandle, EngineError> {
+        self.inner.generate(messages).await
+    }
+    async fn sleep(&mut self) -> Result<(), EngineError> {
+        self.inner.sleep().await
+    }
+    async fn wake_up(&mut self) -> Result<(), EngineError> {
+        self.inner.wake_up().await
+    }
+    async fn is_sleeping(&self) -> bool {
+        self.inner.is_sleeping().await
+    }
+    async fn prefill(&self, messages: &[ChatMessage]) -> Result<(), EngineError> {
+        self.inner.prefill(messages).await
+    }
+    async fn tokenize(
+        &self,
+        messages: &[ChatMessage],
+    ) -> Result<crate::engine::Tokenized, EngineError> {
+        self.inner.tokenize(messages).await
+    }
+    async fn encode(&self, text: &str) -> Result<Vec<u32>, EngineError> {
+        self.inner.encode(text).await
+    }
+    async fn stop_model(&mut self) -> Result<(), EngineError> {
+        self.inner.stop_model().await
+    }
+    fn try_wait_for_exit(&mut self) -> Option<ExitStatus> {
+        self.inner.try_wait_for_exit()
+    }
+    fn pid(&self) -> Option<u32> {
+        self.inner.pid()
+    }
+}

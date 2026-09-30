@@ -117,8 +117,8 @@ pub fn validate_transition(from: SessionState, to: SessionState) -> Result<(), S
         (Starting, Recovering) => Ok(()),
         // `ralph recover` succeeded: context replayed onto a fresh/reused worker.
         (Recovering, Active) => Ok(()),
-        // the bounded automatic restart policy gave up; per Invariant 5 this is still
-        // not a session failure, so it lands in Stopped, not Failed.
+        // the bounded automatic restart policy gave up; a worker crash is still not a
+        // session failure, so it lands in Stopped, not Failed.
         (Recovering, Stopped) => Ok(()),
         // reserved for a genuinely unrecoverable session found during recovery.
         (Recovering, Failed) => Ok(()),
@@ -260,9 +260,9 @@ mod tests {
         SessionState::Moving,
     ];
 
-    /// Rollback-completeness audit (Phase 7 gate 1): an in-transit state a crash or
-    /// cancellation can leave a session in must always have a defined way out, or that
-    /// session is stuck forever with no operation able to touch it again.
+    /// Rollback-completeness audit: an in-transit state a crash or cancellation can
+    /// leave a session in must always have a defined way out, or that session is stuck
+    /// forever with no operation able to touch it again.
     #[test]
     fn every_in_transit_state_has_at_least_one_outgoing_transition() {
         for &from in IN_TRANSIT {

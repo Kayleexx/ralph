@@ -122,3 +122,146 @@ fn checkpoint_pause_resume_fast_then_portable_fallback_paths() {
     );
     assert_eq!(h.inspect()["session"]["id"], session_id);
 }
+
+/// Session-continuity audit at real scale: existing tests all build 2-4 turns of
+/// history — this proves replay/prefill still reproduces exact recall across a
+/// checkpoint/pause/resume round trip with a genuinely deep history, not just a toy one.
+#[test]
+#[ignore]
+fn deep_history_replays_correctly_across_native_and_portable_resume() {
+    if !enabled() {
+        return;
+    }
+    let mut h = Harness::new();
+    let original = h.start();
+    let session_id = original["id"].as_str().unwrap().to_string();
+    h.json(&[
+        "query",
+        SESSION,
+        "Remember the secret word papaya. Reply with that word only.",
+    ]);
+
+    // The first worker never had the KV connector attached (nothing was checkpointed
+    // before it started), so its first checkpoint/pause/resume is honestly portable —
+    // same mechanic `checkpoint_pause_resume_fast_then_portable_fallback_paths` already
+    // documents. Only the *resumed* worker (started with the connector from the outset)
+    // can produce a real native resume, so the deep history is built after this warm-up.
+    h.checkpoint();
+    h.pause();
+    wait_until(Duration::from_secs(10), || h.worker().is_none());
+    let resumed = h.resume();
+    assert_eq!(
+        resumed["native"], false,
+        "warm-up resume should be portable: {resumed}"
+    );
+
+    for i in 0..25 {
+        h.json(&[
+            "query",
+            SESSION,
+            &format!("Say the number {i}. Just the number."),
+        ]);
+    }
+
+    h.checkpoint();
+    h.pause();
+    wait_until(Duration::from_secs(10), || h.worker().is_none());
+    let resumed = h.resume();
+    assert_eq!(resumed["native"], true, "expected native resume: {resumed}");
+    let reply = h.json(&[
+        "query",
+        SESSION,
+        "What secret word did I ask you to remember at the very start? One word only.",
+    ]);
+    assert!(
+        reply["text"]
+            .as_str()
+            .unwrap()
+            .to_lowercase()
+            .contains("papaya"),
+        "deep history lost the early turn on native resume: {reply}"
+    );
+
+    h.pause();
+    wait_until(Duration::from_secs(10), || h.worker().is_none());
+    std::fs::remove_dir_all(h.kvcache_dir(&session_id)).unwrap();
+    let resumed = h.resume();
+    assert_eq!(
+        resumed["native"], false,
+        "expected portable resume: {resumed}"
+    );
+    let reply = h.json(&[
+        "query",
+        SESSION,
+        "What secret word did I ask you to remember at the very start? One word only.",
+    ]);
+    assert!(
+        reply["text"]
+            .as_str()
+            .unwrap()
+            .to_lowercase()
+            .contains("papaya"),
+        "deep history lost the early turn on portable replay: {reply}"
+    );
+}
+
+/// A vLLM upgrade (same engine, different version) must be treated the same as any
+/// other fingerprint mismatch: resume stays correct via the portable path, and
+/// `inspect` reports the honest reason rather than a bare "unavailable".
+#[test]
+#[ignore]
+fn engine_version_change_forces_portable_resume_and_is_reported_honestly() {
+    if !enabled() {
+        return;
+    }
+    let mut h = Harness::new();
+    h.start();
+    h.json(&[
+        "query",
+        SESSION,
+        "Remember the secret word kiwi. Reply with that word only.",
+    ]);
+    h.checkpoint();
+    h.pause();
+    wait_until(Duration::from_secs(10), || h.worker().is_none());
+    h.resume();
+    h.json(&[
+        "query",
+        SESSION,
+        "What secret word did I ask you to remember? One word only.",
+    ]);
+    h.checkpoint();
+    h.pause();
+    wait_until(Duration::from_secs(10), || h.worker().is_none());
+
+    h.db()
+        .execute(
+            "UPDATE sessions SET engine_version = 'upgraded-for-test' WHERE name = ?1",
+            [SESSION],
+        )
+        .unwrap();
+    assert_eq!(
+        h.inspect()["restore_readiness"],
+        "portable only - engine mismatch"
+    );
+
+    let resumed = h.resume();
+    assert_eq!(resumed["session"]["state"], "active");
+    assert_eq!(
+        resumed["native"], false,
+        "an engine-version mismatch must never be trusted for native resume: {resumed}"
+    );
+    let reply = h.json(&[
+        "query",
+        SESSION,
+        "What secret word did I ask you to remember? One word only.",
+    ]);
+    assert!(
+        reply["text"]
+            .as_str()
+            .unwrap()
+            .to_lowercase()
+            .contains("kiwi"),
+        "context lost across an engine-version change: {reply}"
+    );
+}

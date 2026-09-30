@@ -1,8 +1,8 @@
 //! The `.ralph` portable session artifact: a plain `tar` container with our own
 //! path-safety checks on read (never `tar::Archive::unpack()`, which trusts
 //! archive-supplied paths) and a whole-artifact checksum to catch corruption before
-//! anything is imported. No compression, no crypto-hash dependency — see RALPH_SPEC.md
-//! §17 Phase 5 and §16.8's export/import edge cases.
+//! anything is imported. No compression, no crypto-hash dependency needed for either
+//! goal.
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 

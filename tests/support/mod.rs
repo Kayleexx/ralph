@@ -3,9 +3,10 @@
 // makes every helper "unused" in some binary's own compilation, not actually dead code.
 #![allow(dead_code)]
 
+mod ownership;
+
 use rusqlite::Connection;
 use serde_json::Value;
-use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -190,6 +191,22 @@ impl Harness {
     pub fn hibernate(&self) -> Value {
         self.json(&["hibernate", SESSION])
     }
+    pub fn migrate_json(&self, to: u32) -> Output {
+        self.command()
+            .args(["--json", "migrate", SESSION, "--to", &to.to_string()])
+            .output()
+            .unwrap()
+    }
+    pub fn migrate(&self, to: u32) -> Value {
+        let out = self.migrate_json(to);
+        assert!(
+            out.status.success(),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice(&out.stdout).unwrap()
+    }
     pub fn resume_json(&self, args: &[&str]) -> Output {
         self.command()
             .arg("--json")
@@ -253,7 +270,7 @@ impl Harness {
         self.command().args(&args).output().unwrap()
     }
     pub fn drain(&self, location: &str, to: Option<&str>, yes: bool) -> Value {
-        let mut args = vec!["--json", "drain", location];
+        let mut args = vec!["drain", location];
         if let Some(to) = to {
             args.push("--to");
             args.push(to);
@@ -273,74 +290,7 @@ impl Harness {
     }
 }
 
-pub fn healthy(worker: &Value) -> bool {
-    let Some(endpoint) = worker["endpoint"]
-        .as_str()
-        .and_then(|s| s.strip_prefix("http://"))
-    else {
-        return false;
-    };
-    let Ok(addr) = endpoint.parse() else {
-        return false;
-    };
-    let Ok(mut stream) = std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(100))
-    else {
-        return false;
-    };
-    stream
-        .set_read_timeout(Some(Duration::from_millis(100)))
-        .unwrap();
-    if stream.write_all(b"GET /health HTTP/1.0\r\n\r\n").is_err() {
-        return false;
-    }
-    let mut bytes = [0; 128];
-    stream
-        .read(&mut bytes)
-        .is_ok_and(|n| String::from_utf8_lossy(&bytes[..n]).contains("200 OK"))
-}
-
-pub fn signal_owned(worker: &Value, send_signal: bool) {
-    let Some(group) = worker["group"].as_u64() else {
-        return;
-    };
-    let Some(nonce) = worker["nonce"].as_str() else {
-        return;
-    };
-    if std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
-        .ok()
-        .as_deref()
-        != worker["boot"].as_str()
-    {
-        return;
-    }
-    let mut verified = false;
-    for entry in std::fs::read_dir("/proc").unwrap().flatten() {
-        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
-            continue;
-        };
-        let Some((_, rest)) = stat.rsplit_once(')') else {
-            continue;
-        };
-        let fields: Vec<_> = rest.split_whitespace().collect();
-        if fields.get(2).and_then(|s| s.parse::<u64>().ok()) != Some(group)
-            || fields.first() == Some(&"Z")
-        {
-            continue;
-        }
-        let env = std::fs::read(entry.path().join("environ")).unwrap_or_default();
-        assert!(
-            env.split(|b| *b == 0)
-                .any(|kv| kv == format!("RALPH_WORKER_OWNER={nonce}").as_bytes()),
-            "unowned process group member"
-        );
-        verified = true;
-    }
-    if verified && send_signal {
-        let _ = Command::new("kill")
-            .args(["-KILL", "--", &format!("-{group}")])
-            .status();
-    }
-}
+pub use ownership::{healthy, signal_owned, sweep_any_orphaned_worker};
 
 impl Drop for Harness {
     fn drop(&mut self) {
@@ -375,5 +325,10 @@ impl Drop for Harness {
         for worker in &self.workers {
             signal_owned(worker, true);
         }
+        // Belt-and-suspenders: `self.workers` is only ever as fresh as the last
+        // `worker.json` read caught — a still-live worker whose record was never
+        // captured (or was captured stale, mid-generation-change) would otherwise leak
+        // past this Drop entirely and starve every test that runs after it.
+        sweep_any_orphaned_worker();
     }
 }

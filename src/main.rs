@@ -5,6 +5,7 @@ mod checkpoint;
 mod cli;
 mod client;
 mod commands;
+mod continuity;
 mod daemon;
 mod doctor;
 mod engine;
@@ -72,7 +73,13 @@ async fn dispatch(cli: Cli) -> i32 {
                 1
             }
         },
-        Command::Run { model, name } => commands::run_run(&home, flags, model, name).await,
+        Command::Run {
+            model,
+            name,
+            gpu,
+            policy,
+            continuity_target,
+        } => commands::run_run(&home, flags, model, name, gpu, policy, continuity_target).await,
         Command::Query { session, prompt } => {
             commands::run_query(&home, flags, session, prompt).await
         }
@@ -83,6 +90,7 @@ async fn dispatch(cli: Cli) -> i32 {
         Command::Checkpoint { session } => commands::run_checkpoint(&home, flags, session).await,
         Command::Pause { session } => commands::run_pause(&home, flags, session).await,
         Command::Hibernate { session } => commands::run_hibernate(&home, flags, session).await,
+        Command::Migrate { session, to } => commands::run_migrate(&home, flags, session, to).await,
         Command::Resume {
             session,
             fast_only,

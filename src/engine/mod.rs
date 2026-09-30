@@ -55,6 +55,9 @@ pub struct ModelSpec {
     pub revision: Option<String>,
     pub profile: Option<profiles::WorkerProfile>,
     pub kv_offload: Option<KvOffloadSpec>,
+    /// Physical GPU index this worker binds to (`CUDA_VISIBLE_DEVICES`) — `0` on every
+    /// existing single-GPU call site, unchanged behavior.
+    pub gpu: u32,
 }
 
 #[derive(Debug, Clone)]

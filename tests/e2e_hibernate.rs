@@ -57,7 +57,7 @@ fn hibernate_then_resume_round_trip_and_portable_fallback() {
     );
 
     // Deleting the KV directory must still allow a portable resume out of Hibernated —
-    // same Invariant 2 guarantee pause/resume already relies on.
+    // same guarantee pause/resume already relies on: acceleration state is disposable.
     h.checkpoint();
     let hibernated = h.hibernate();
     assert_eq!(hibernated["state"], "hibernated");

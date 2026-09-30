@@ -3,6 +3,8 @@
 //! rather than a hand-written "not implemented yet" message.
 use clap::{CommandFactory, Parser, Subcommand};
 
+use crate::continuity::ContinuityPolicy;
+
 #[derive(Parser)]
 #[command(
     name = "ralph",
@@ -36,6 +38,18 @@ pub enum Command {
         /// Session name. Omit to get a generated (or picker-suggested) one.
         #[arg(long)]
         name: Option<String>,
+        /// GPU index to admit this worker onto. Omit for GPU 0 (today's only behavior
+        /// on a single-GPU machine).
+        #[arg(long)]
+        gpu: Option<u32>,
+        /// How aggressively to preserve this session's acceleration state under VRAM
+        /// pressure. Omit for warm (today's default demotion behavior).
+        #[arg(long)]
+        policy: Option<ContinuityPolicy>,
+        /// How fast (ms) this session should be restorable if demoted — a target, not a
+        /// guarantee; Ralph reports honestly if it can't be met.
+        #[arg(long)]
+        continuity_target: Option<u64>,
     },
     /// Send a prompt to a session and stream the response (one-shot, scriptable)
     Query {
@@ -76,6 +90,16 @@ pub enum Command {
     Hibernate {
         /// Session name, id, or a unique id prefix.
         session: String,
+    },
+    /// Move an active session's worker to a different GPU on this machine, preserving
+    /// session id/history. Always reconstructs from durable history (portable) — native
+    /// KV never crosses GPUs.
+    Migrate {
+        /// Session name, id, or a unique id prefix.
+        session: String,
+        /// Target GPU index.
+        #[arg(long)]
+        to: u32,
     },
     /// Reattach a paused session, fast (native KV) if a compatible checkpoint exists
     Resume {

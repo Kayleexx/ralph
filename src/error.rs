@@ -196,7 +196,7 @@ pub fn envelope(err: &CliError) -> Envelope {
         CliError::InvalidState(reason) => Envelope {
             summary: "session cannot do this right now".to_string(),
             detail: vec![reason.clone()],
-            next: None,
+            next: Some("run: ralph ps".to_string()),
         },
         CliError::Startup { summary, .. } => Envelope {
             summary: summary.clone(),

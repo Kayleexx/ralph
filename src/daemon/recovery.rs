@@ -1,6 +1,6 @@
 //! Crash detection, bounded automatic restart, and `ralph recover`. A worker crash
-//! demotes its sessions to `Recovering`, not `Stopped` (Invariant 5: a worker crash is
-//! not a session failure). The daemon then makes a bounded, contextless attempt to get a
+//! demotes its sessions to `Recovering`, not `Stopped` — a worker crash is not a session
+//! failure. The daemon then makes a bounded, contextless attempt to get a
 //! fresh worker running for that model; reattaching a specific session's conversation is
 //! always the explicit, user-driven `ralph recover`, never automatic.
 use std::sync::Arc;
@@ -9,7 +9,7 @@ use std::time::Instant;
 use tokio::sync::Mutex as AsyncMutex;
 
 use super::restart::RestartPolicy;
-use super::{Daemon, WorkerEntry, cancelled, map_engine_error, to_session_info};
+use super::{Daemon, WorkerEntry, WorkerKey, cancelled, map_engine_error, to_session_info};
 use crate::engine::{Engine, ResolvedModel};
 use crate::error::CliError;
 use crate::ipc::SessionInfo;
@@ -103,6 +103,7 @@ impl<E: Engine + 'static> Daemon<E> {
         session_id: &str,
         cancel: &mut Option<tokio::sync::oneshot::Receiver<()>>,
         allow_native: bool,
+        gpu_index: u32,
     ) -> Result<(Arc<AsyncMutex<E>>, ResolvedModel, Option<i64>), CliError> {
         if self.is_draining() {
             return Err(CliError::Resource(
@@ -115,10 +116,21 @@ impl<E: Engine + 'static> Daemon<E> {
                 "a worker is starting or attaching; session preserved, retry shortly".into(),
             )
         })?;
+        // Cleared per admission attempt (not just on read) so a make-room event from an
+        // earlier, unrelated call — one that never happened to read this slot, e.g.
+        // `resume`/`recover` — can never be misattributed to this one.
+        *self
+            .last_make_room
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         let row = self.storage().resolve(session_id)?;
+        let key = WorkerKey {
+            model: model.to_string(),
+            gpu: gpu_index,
+        };
         let workers = self.workers.lock().await;
         let reuse = workers
-            .get(model)
+            .get(&key)
             .map(|entry| (entry.engine.clone(), entry.resolved.clone(), entry.profile));
         drop(workers);
 
@@ -139,10 +151,11 @@ impl<E: Engine + 'static> Daemon<E> {
                 ));
             }
             self.share_profile(session_id, profile)?;
-            self.wake_reserved(&engine_handle, profile).await?;
+            self.wake_reserved(&engine_handle, profile, gpu_index)
+                .await?;
             let pid = engine_handle.lock().await.pid().map(i64::from);
             let mut workers = self.workers.lock().await;
-            let Some(entry) = workers.get_mut(model) else {
+            let Some(entry) = workers.get_mut(&key) else {
                 return Err(CliError::Resource(
                     "worker exited while attaching this session".to_string(),
                 ));
@@ -157,7 +170,7 @@ impl<E: Engine + 'static> Daemon<E> {
 
         let dir = session::session_dir(&self.sessions_root, session_id);
         let mut engine = (self.make_engine)(session::vllm_log_path(&dir));
-        let spec = self.admitted_spec(&row, allow_native).await?;
+        let spec = self.admitted_spec(&row, allow_native, gpu_index).await?;
         let started = {
             let startup = engine.start_model(&spec);
             tokio::pin!(startup);
@@ -185,7 +198,7 @@ impl<E: Engine + 'static> Daemon<E> {
         let pid = engine.pid().map(i64::from);
         let handle = Arc::new(AsyncMutex::new(engine));
         self.workers.lock().await.insert(
-            model.to_string(),
+            key.clone(),
             WorkerEntry {
                 engine: handle.clone(),
                 resolved: resolved.clone(),
@@ -195,14 +208,14 @@ impl<E: Engine + 'static> Daemon<E> {
                 last_active: Instant::now(),
             },
         );
-        self.spawn_worker_supervisor(model.to_string(), handle.clone());
+        self.spawn_worker_supervisor(key, handle.clone());
         Ok((handle, resolved, pid))
     }
 
     /// Reconstructs `session`'s context from the durable token log and attaches it to a
     /// live worker. Accepts sessions left `Recovering` (crash/restart) or `Stopped`;
     /// `Failed` is never accepted — that's reserved for a
-    /// genuinely unrecoverable session, not infrastructure flakiness (Invariant 5).
+    /// genuinely unrecoverable session, not infrastructure flakiness.
     #[cfg(test)]
     pub async fn recover(self: &Arc<Self>, identifier: &str) -> Result<SessionInfo, CliError> {
         self.recover_cancellable(identifier, None).await
@@ -242,7 +255,13 @@ impl<E: Engine + 'static> Daemon<E> {
             self.transition(&row.id, row.state, SessionState::Recovering, None)?;
         }
         let attach = self
-            .attach_or_start_worker(&row.model, &row.id, &mut cancel, true)
+            .attach_or_start_worker(
+                &row.model,
+                &row.id,
+                &mut cancel,
+                true,
+                session::gpu_index_of(&row.location),
+            )
             .await;
         let (engine, resolved, pid) = match attach {
             Ok(v) => v,
@@ -290,10 +309,11 @@ impl<E: Engine + 'static> Daemon<E> {
 /// Called by the worker supervisor when a live worker's process exits unexpectedly.
 pub(super) async fn handle_worker_loss<E: Engine + 'static>(
     daemon: &Arc<Daemon<E>>,
-    model: String,
+    key: WorkerKey,
     session_ids: Vec<String>,
     kv_engine_id: Option<String>,
 ) {
+    let model = key.model.clone();
     // vLLM does not unlink its own `/dev/shm/vllm_offload_<engine_id>.mmap` on SIGKILL
     // (confirmed by reproducing it) — the crashed worker can no longer do it itself, so
     // the crash handler owns this cleanup.
@@ -332,7 +352,7 @@ pub(super) async fn handle_worker_loss<E: Engine + 'static>(
             break false;
         }
         match daemon
-            .attach_or_start_worker(&model, session_id, &mut cancel, true)
+            .attach_or_start_worker(&model, session_id, &mut cancel, true, key.gpu)
             .await
         {
             Ok(_) => break true,
@@ -351,7 +371,7 @@ pub(super) async fn handle_worker_loss<E: Engine + 'static>(
 
     if restarted {
         let mut workers = daemon.workers.lock().await;
-        if let Some(entry) = workers.get_mut(&model) {
+        if let Some(entry) = workers.get_mut(&key) {
             for id in &session_ids {
                 if !entry.session_ids.contains(id) {
                     entry.session_ids.push(id.clone());

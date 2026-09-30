@@ -5,7 +5,6 @@ use tokio::sync::oneshot;
 use super::tests::*;
 use super::tests_ssh_support::fake_ssh_script;
 use super::*;
-use lifecycle::ResumeMode;
 
 fn daemon_with_fake_ssh(dir: &std::path::Path) -> Arc<Daemon<FakeEngine>> {
     let daemon = test_daemon(dir);
@@ -52,13 +51,10 @@ async fn ssh_auth_failure_rolls_back_to_paused_and_session_stays_usable() {
         .await
         .unwrap_err();
     assert!(matches!(err, CliError::Resource(_)));
-    // Active released its worker before the probe ever ran, so rollback lands Paused.
-    assert_eq!(daemon.inspect("demo").unwrap().session.state, "paused");
-    daemon
-        .resume_cancellable("demo", ResumeMode::Auto, None)
-        .await
-        .unwrap();
+    // The reachability probe runs before the worker is ever released, so an
+    // SSH-level failure never touches the live session at all.
     assert_eq!(daemon.inspect("demo").unwrap().session.state, "active");
+    daemon.begin_query("demo", "still usable").await.unwrap();
 }
 
 #[tokio::test]
@@ -75,7 +71,9 @@ async fn incompatible_protocol_version_rolls_back_before_any_transfer() {
         .await
         .unwrap_err();
     assert!(matches!(err, CliError::Usage(_)));
-    assert_eq!(daemon.inspect("demo").unwrap().session.state, "paused");
+    // Protocol-version mismatch is caught by the same early probe, before any local
+    // disruption.
+    assert_eq!(daemon.inspect("demo").unwrap().session.state, "active");
 }
 
 #[tokio::test]

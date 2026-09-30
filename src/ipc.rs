@@ -4,11 +4,16 @@
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+use crate::continuity::ContinuityPolicy;
+
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Request {
     Run {
         model: String,
         name: Option<String>,
+        gpu: Option<u32>,
+        policy: Option<ContinuityPolicy>,
+        continuity_target_ms: Option<u64>,
     },
     Query {
         session: String,
@@ -55,6 +60,10 @@ pub enum Request {
         to: Option<String>,
         yes: bool,
     },
+    Migrate {
+        session: String,
+        to: u32,
+    },
 }
 
 /// Sent by the client in place of a new request while a `Query` is streaming, to cancel
@@ -73,6 +82,11 @@ pub struct SessionInfo {
     pub pid: Option<i64>,
     pub location: String,
     pub token_count: i64,
+    /// The name of a session `ralph run` hibernated to free VRAM for this one, if
+    /// pressure-aware admission had to (`daemon::continuity::make_room`) — `None` on
+    /// every other response that reuses `SessionInfo` (`ps`, `inspect`, ...).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub made_room_for: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -81,6 +95,11 @@ pub struct ResumeInfo {
     /// Best-effort, honest-only: `false` unless a still-compatible KV directory with
     /// actual content was found — never claims a native restore that didn't happen.
     pub native: bool,
+    /// Resume on an already-active session is an idempotent no-op, not a rebuild —
+    /// distinguishes that from a genuine portable-fallback resume (both report
+    /// `native: false`), so the CLI doesn't claim a KV rebuild that never happened.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub already_active: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -90,11 +109,19 @@ pub struct InspectInfo {
     pub session: SessionInfo,
     pub recoverability: String,
     pub fast_restore: String,
+    /// Why, not just whether — `RestoreReadiness::as_str()`.
+    pub restore_readiness: String,
+    /// (field, current, stored) triples that differ, `--verbose` only. Never prompt content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint_diff: Option<Vec<(String, String, String)>>,
     pub portable_state: String,
     /// `"user@gpu-box as research"` once `ralph handoff` has committed this session
     /// elsewhere — `None` otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub moved_to: Option<String>,
+    pub continuity_policy: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuity_target_ms: Option<i64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -116,7 +143,35 @@ pub enum Response {
     Inspect(InspectInfo),
     Resume(ResumeInfo),
     Drain(DrainReport),
+    Migrate(MigrationReport),
     Error(ErrorPayload),
+}
+
+/// Everything Stage C's migration work asks to be measured, alongside the resulting
+/// `SessionInfo`. The CLI only prints a terse progress/summary line in plain mode; this
+/// whole struct is what `--json`/`--verbose` show.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MigrationReport {
+    pub session: SessionInfo,
+    pub source_gpu: u32,
+    pub destination_gpu: u32,
+    pub native: bool,
+    pub total_ms: f64,
+    /// Wall-clock time the session had no live worker at all — from the source
+    /// worker's process actually stopping to the destination worker committing Active.
+    pub interruption_ms: f64,
+    pub replay_prefill_ms: f64,
+    pub token_count: i64,
+    pub source_vram_freed_mib: Option<u64>,
+    pub destination_vram_used_mib: Option<u64>,
+    /// Always `None` today: the first correct implementation is always portable
+    /// reconstruction (replay from durable history), which moves no KV bytes at all —
+    /// this field exists for when/if a proven-safe native cross-GPU KV transfer lands.
+    pub bytes_transferred: Option<u64>,
+    /// Not measured here: a real time-to-first-token needs an actual generation call,
+    /// which a lifecycle op has no business making on its own. `None` in production;
+    /// the dual-GPU acceptance harness measures it with a real post-migration query.
+    pub ttft_ms: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -187,13 +242,25 @@ mod tests {
         let request = Request::Run {
             model: "demo-model".to_string(),
             name: Some("demo".to_string()),
+            gpu: None,
+            policy: None,
+            continuity_target_ms: None,
         };
         write_frame(&mut client, &request).await.unwrap();
         let received: Request = read_frame(&mut server).await.unwrap().unwrap();
         match received {
-            Request::Run { model, name } => {
+            Request::Run {
+                model,
+                name,
+                gpu,
+                policy,
+                continuity_target_ms,
+            } => {
                 assert_eq!(model, "demo-model");
                 assert_eq!(name.as_deref(), Some("demo"));
+                assert_eq!(gpu, None);
+                assert_eq!(policy, None);
+                assert_eq!(continuity_target_ms, None);
             }
             _ => panic!("wrong variant"),
         }

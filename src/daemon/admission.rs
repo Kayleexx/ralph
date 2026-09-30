@@ -10,15 +10,16 @@ use crate::error::CliError;
 use crate::storage::SessionRow;
 
 pub(super) struct GpuMemory {
+    pub index: u32,
     pub name: String,
-    pub total_mib: u64,
     pub free_mib: u64,
     pub allocations: HashMap<u32, u64>,
 }
 
-pub(super) fn gpu_memory() -> Result<GpuMemory, CliError> {
-    fn query(args: &[&str]) -> Result<String, CliError> {
+pub(super) fn gpu_memory(index: u32) -> Result<GpuMemory, CliError> {
+    fn query(index: u32, args: &[&str]) -> Result<String, CliError> {
         let out = std::process::Command::new("nvidia-smi")
+            .arg(format!("--id={index}"))
             .args(args)
             .output()
             .map_err(|e| {
@@ -33,11 +34,13 @@ pub(super) fn gpu_memory() -> Result<GpuMemory, CliError> {
         }
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     }
-    let gpu = query(&[
-        "--id=0",
-        "--query-gpu=name,memory.total,memory.free",
-        "--format=csv,noheader,nounits",
-    ])?;
+    let gpu = query(
+        index,
+        &[
+            "--query-gpu=name,memory.total,memory.free",
+            "--format=csv,noheader,nounits",
+        ],
+    )?;
     let fields: Vec<_> = gpu.trim().split(',').map(str::trim).collect();
     let bad = || {
         CliError::Resource(
@@ -47,11 +50,13 @@ pub(super) fn gpu_memory() -> Result<GpuMemory, CliError> {
     if fields.len() != 3 {
         return Err(bad());
     }
-    let apps = query(&[
-        "--id=0",
-        "--query-compute-apps=pid,used_gpu_memory",
-        "--format=csv,noheader,nounits",
-    ])?;
+    let apps = query(
+        index,
+        &[
+            "--query-compute-apps=pid,used_gpu_memory",
+            "--format=csv,noheader,nounits",
+        ],
+    )?;
     let mut allocations = HashMap::new();
     for line in apps.lines().filter(|s| !s.trim().is_empty()) {
         let Some((pid, memory)) = line.split_once(',') else {
@@ -62,12 +67,35 @@ pub(super) fn gpu_memory() -> Result<GpuMemory, CliError> {
             memory.trim().parse().map_err(|_| bad())?,
         );
     }
+    // `fields[1]` (memory.total) isn't used, but the query still asks for it so the
+    // 3-field count check catches a genuinely unreadable line rather than one that
+    // happens to parse with only 2.
     Ok(GpuMemory {
+        index,
         name: fields[0].into(),
-        total_mib: fields[1].parse().map_err(|_| bad())?,
         free_mib: fields[2].parse().map_err(|_| bad())?,
         allocations,
     })
+}
+
+fn pick_profile(
+    saved: Option<WorkerProfile>,
+    candidates: &[WorkerProfile],
+    free: u64,
+    reserved: u64,
+) -> Option<WorkerProfile> {
+    saved
+        .filter(|p| p.reservation_mib() + reserved <= free)
+        .or_else(|| {
+            if saved.is_none() {
+                candidates
+                    .iter()
+                    .copied()
+                    .find(|p| p.reservation_mib() + reserved <= free)
+            } else {
+                None
+            }
+        })
 }
 
 fn group(pid: u32) -> Option<u32> {
@@ -86,8 +114,9 @@ impl<E: Engine + 'static> Daemon<E> {
             .workers
             .lock()
             .await
-            .values()
-            .filter_map(|w| w.profile.map(|p| (w.engine.clone(), p)))
+            .iter()
+            .filter(|(key, _)| key.gpu == gpu.index)
+            .filter_map(|(_, w)| w.profile.map(|p| (w.engine.clone(), p)))
             .collect();
         let mut deficit = 0;
         for (engine, profile) in entries {
@@ -106,22 +135,22 @@ impl<E: Engine + 'static> Daemon<E> {
         deficit
     }
 
-    async fn available_vram(&self) -> Result<(u64, u64), CliError> {
-        let gpu = (self.gpu_memory)()?;
-        if gpu.name != "NVIDIA GeForce RTX 5050 Laptop GPU" || gpu.total_mib != 8151 {
-            return Err(CliError::Resource(format!(
-                "no measured safe profiles for {}; session preserved, use a measured GPU",
-                gpu.name
-            )));
-        }
+    // `gpu_memory(index)` (an injectable fn pointer — real callers hit `nvidia-smi
+    // --id=<index>`, which itself fails cleanly with a nonzero exit for an out-of-range
+    // index) is the one and only visibility check — no separate `gpu_count()`
+    // pre-check, so tests can simulate an unavailable GPU by overriding `gpu_memory`
+    // rather than needing real multi-GPU hardware.
+    async fn available_vram(&self, gpu_index: u32) -> Result<(u64, u64), CliError> {
+        let gpu = (self.gpu_memory)(gpu_index)?;
         let reserved = self.reserved_deficit(&gpu).await + HEADROOM_MIB;
         Ok((gpu.free_mib, reserved))
     }
 
     pub(super) async fn admitted_spec(
-        &self,
+        self: &Arc<Self>,
         row: &SessionRow,
         allow_native: bool,
+        gpu_index: u32,
     ) -> Result<ModelSpec, CliError> {
         let kv_offload = allow_native.then(|| self.kv_offload_for(row)).flatten();
         let saved = self.storage().worker_profile(&row.id)?;
@@ -129,10 +158,17 @@ impl<E: Engine + 'static> Daemon<E> {
             .workers
             .lock()
             .await
-            .values()
-            .any(|w| w.profile.is_none());
+            .iter()
+            .filter(|(key, _)| key.gpu == gpu_index)
+            .any(|(_, w)| w.profile.is_none());
         let Some((revision, candidates)) = profiles::measured(&row.model) else {
-            if saved.is_some() || !self.workers.lock().await.is_empty() {
+            let any_on_this_gpu = self
+                .workers
+                .lock()
+                .await
+                .keys()
+                .any(|key| key.gpu == gpu_index);
+            if saved.is_some() || any_on_this_gpu {
                 return Err(CliError::Resource(format!(
                     "{} has no measured safe co-residency profile; session preserved, use a measured Qwen model",
                     row.model
@@ -143,6 +179,7 @@ impl<E: Engine + 'static> Daemon<E> {
                 revision: row.model_revision.clone(),
                 profile: None,
                 kv_offload,
+                gpu: gpu_index,
             });
         };
         if other_unmeasured {
@@ -166,24 +203,40 @@ impl<E: Engine + 'static> Daemon<E> {
         // papering over a logic bug (unlike a sleep-based test wait).
         let mut attempt = 0;
         let (free, reserved, profile) = loop {
-            let (free, reserved) = self.available_vram().await?;
-            let profile = saved
-                .filter(|p| p.reservation_mib() + reserved <= free)
-                .or_else(|| {
-                    if saved.is_none() {
-                        candidates
-                            .iter()
-                            .copied()
-                            .find(|p| p.reservation_mib() + reserved <= free)
-                    } else {
-                        None
-                    }
-                });
+            let (free, reserved) = self.available_vram(gpu_index).await?;
+            let profile = pick_profile(saved, candidates, free, reserved);
             attempt += 1;
             if profile.is_some() || attempt >= 5 {
                 break (free, reserved, profile);
             }
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        };
+        // Every retry above only absorbs driver VRAM-reclaim lag; nothing changes the
+        // *actual* free VRAM. If it's still not enough, try demoting one other resident
+        // session once (`make_room`) before giving up — the one real "make room" attempt
+        // this phase performs, never touching the session being admitted itself. The
+        // freed VRAM is subject to the exact same driver-reclaim lag as above (confirmed
+        // live: a single immediate re-check right after `make_room`'s own `kill -KILL`
+        // can still read the pre-eviction free figure), so this re-check gets the same
+        // bounded retry, not a one-shot look.
+        let (free, reserved, profile) = if profile.is_none() {
+            match self.make_room(gpu_index, &row.id).await {
+                Some(_freed) => {
+                    let mut attempt = 0;
+                    loop {
+                        let (free, reserved) = self.available_vram(gpu_index).await?;
+                        let profile = pick_profile(saved, candidates, free, reserved);
+                        attempt += 1;
+                        if profile.is_some() || attempt >= 5 {
+                            break (free, reserved, profile);
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    }
+                }
+                None => (free, reserved, profile),
+            }
+        } else {
+            (free, reserved, profile)
         };
         let Some(profile) = profile else {
             let minimum = saved
@@ -202,6 +255,7 @@ impl<E: Engine + 'static> Daemon<E> {
             revision: Some(revision.into()),
             profile: Some(profile),
             kv_offload,
+            gpu: gpu_index,
         })
     }
 
@@ -227,12 +281,13 @@ impl<E: Engine + 'static> Daemon<E> {
         &self,
         engine: &Arc<AsyncMutex<E>>,
         profile: Option<WorkerProfile>,
+        gpu_index: u32,
     ) -> Result<(), CliError> {
         if !engine.lock().await.is_sleeping().await {
             return Ok(());
         }
         if profile.is_some() {
-            let (free, reserved) = self.available_vram().await?;
+            let (free, reserved) = self.available_vram(gpu_index).await?;
             if free < reserved {
                 return Err(CliError::Resource(format!(
                     "cannot wake worker safely: {free} MiB free, {reserved} MiB required for wake reserves and headroom; session preserved, free VRAM and retry"
@@ -251,11 +306,12 @@ impl<E: Engine + 'static> Daemon<E> {
         &self,
         engine: &Arc<AsyncMutex<E>>,
         profile: Option<WorkerProfile>,
+        gpu_index: u32,
     ) -> Result<(), CliError> {
         if !engine.lock().await.is_sleeping().await {
             return Ok(());
         }
         let _startup = self.startup.lock().await;
-        self.wake_reserved(engine, profile).await
+        self.wake_reserved(engine, profile, gpu_index).await
     }
 }

@@ -1,9 +1,8 @@
-//! Basic idle policy (RALPH_SPEC.md §17 Phase 4): auto-hibernates sessions that have had
-//! no query activity for a while. Deliberately not a scheduler — one fixed threshold, one
-//! poll loop, reusing the same per-session lock every other operation already goes
-//! through, so a concurrent pause/resume/query just makes this tick skip that session
-//! rather than needing its own cancellation protocol (§16.7 "user resumes while automatic
-//! hibernation is happening").
+//! Basic idle policy: auto-hibernates sessions that have had no query activity for a
+//! while. Deliberately not a scheduler — one fixed threshold, one poll loop, reusing the
+//! same per-session lock every other operation already goes through, so a concurrent
+//! pause/resume/query just makes this tick skip that session rather than needing its own
+//! cancellation protocol.
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,9 +15,12 @@ use crate::error::CliError;
 use crate::state::SessionState;
 
 const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
-const IDLE_HIBERNATE_AFTER: Duration = Duration::from_secs(900);
+/// Also the make-room eligibility threshold (`continuity.rs`) — a session isn't
+/// "cheap to sacrifice" just because it's momentarily asleep, only once it's been
+/// idle long enough that this same sweep would hibernate it anyway.
+pub(super) const IDLE_HIBERNATE_AFTER: Duration = Duration::from_secs(900);
 
-fn idle_for(updated_at: &str) -> Option<Duration> {
+pub(super) fn idle_for(updated_at: &str) -> Option<Duration> {
     let then = OffsetDateTime::parse(updated_at, &Rfc3339).ok()?;
     Some((OffsetDateTime::now_utc() - then).unsigned_abs())
 }
@@ -46,7 +48,7 @@ impl<E: Engine + 'static> Daemon<E> {
             if idle < IDLE_HIBERNATE_AFTER {
                 continue;
             }
-            // A lock-contention InvalidState just means a concurrent op has it (§16.7).
+            // A lock-contention InvalidState just means a concurrent op already has it.
             if let Err(error) = self.hibernate_cancellable(&row.id, None).await
                 && !matches!(error, CliError::InvalidState(_))
             {

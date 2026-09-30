@@ -44,8 +44,8 @@ pub fn cleanup_shm(engine_id: &str) {
 }
 
 /// Coarse floor, not an exact accounting of what the fs tier will eventually use — good
-/// enough to refuse the connector outright on a visibly full disk (§16.4 "KV checkpoint
-/// larger than available disk") without pretending to predict real growth.
+/// enough to refuse the connector outright on a visibly full disk without pretending to
+/// predict real growth.
 pub fn has_room(dir: &Path, needed_bytes: u64) -> bool {
     std::fs::create_dir_all(dir).is_ok()
         && fs2::available_space(dir).is_ok_and(|free| free >= needed_bytes)
@@ -57,9 +57,8 @@ const SIGNATURE_FILE: &str = ".ralph_kv_signature";
 /// (recursive — vLLM's own `TieringOffloadingSpec` nests block files several
 /// directories deep, e.g. `<hash>_r0/32d/78_g0/*.bin`), except the signature file
 /// itself. A coarse fingerprint, not a cryptographic hash: good enough to detect the
-/// realistic corruption shapes (truncation, a swapped-in file, a partial write) §16.15
-/// "corrupt KV checkpoint" cares about, without reading gigabytes of KV content on
-/// every checkpoint/resume.
+/// realistic corruption shapes (truncation, a swapped-in file, a partial write) without
+/// reading gigabytes of KV content on every checkpoint/resume.
 fn content_fingerprint(dir: &Path) -> Option<(u64, u64, u64)> {
     fn walk(dir: &Path, total: &mut u64, newest: &mut u64, count: &mut u64) {
         let Ok(entries) = std::fs::read_dir(dir) else {

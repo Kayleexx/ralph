@@ -103,7 +103,14 @@ async fn drain_in_progress_blocks_new_admissions_and_clears_the_flag_afterward()
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let err = daemon
-        .run_cancellable("model".to_string(), Some("other".to_string()), None)
+        .run_cancellable(
+            "model".to_string(),
+            Some("other".to_string()),
+            0,
+            ContinuityPolicy::default(),
+            None,
+            None,
+        )
         .await
         .unwrap_err();
     assert!(matches!(
@@ -115,7 +122,14 @@ async fn drain_in_progress_blocks_new_admissions_and_clears_the_flag_afterward()
     assert!(report.all_safe);
 
     daemon
-        .run_cancellable("model".to_string(), Some("after-drain".to_string()), None)
+        .run_cancellable(
+            "model".to_string(),
+            Some("after-drain".to_string()),
+            0,
+            ContinuityPolicy::default(),
+            None,
+            None,
+        )
         .await
         .unwrap();
 }
@@ -138,9 +152,8 @@ async fn drain_with_a_destination_hands_sessions_off_instead_of_hibernating() {
     assert_eq!(daemon.inspect("demo").unwrap().session.state, "moved");
 }
 
-/// Regression test: `SessionRow.location` is stored as `"local/gpu0"`, but
-/// RALPH_SPEC.md's own examples call it bare `gpu0` (`ralph drain gpu0`) — the bare
-/// form must match, not just the exact stored string.
+/// Regression test: `SessionRow.location` is stored as `"local/gpu0"`, but `ralph drain
+/// gpu0` names it bare — the bare form must match, not just the exact stored string.
 #[tokio::test]
 async fn drain_accepts_the_bare_gpu_name_from_the_spec_examples() {
     let dir = tempfile::tempdir().unwrap();

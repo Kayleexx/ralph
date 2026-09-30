@@ -66,6 +66,11 @@ fn drain_without_yes_only_prints_the_plan() {
     }
     let mut h = Harness::new();
     h.start();
+    // A single-session, hibernate-only drain never needs confirmation (see
+    // `daemon::drain`'s `requires_confirmation`) — a second session (sharing the same
+    // worker, so this stays a single real vLLM cold start) is what actually exercises
+    // the plan-only path this test is named for.
+    h.json(&["run", MODEL, "--name", "second"]);
 
     let report = h.drain("local/gpu0", None, false);
     assert_eq!(report["executed"], false);

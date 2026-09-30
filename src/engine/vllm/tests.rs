@@ -53,6 +53,12 @@ fn serve_args_enable_sleep_mode() {
 }
 
 #[test]
+fn serve_args_enable_prefix_caching_explicitly() {
+    let args = vllm_serve_args("Qwen/Qwen2.5-0.5B-Instruct", 8000, None, None, None);
+    assert!(args.contains(&"--enable-prefix-caching".to_string()));
+}
+
+#[test]
 fn serve_args_include_revision_when_requested() {
     let args = vllm_serve_args("model", 8000, Some("abc123"), None, None);
     let pos = args.iter().position(|a| a == "--revision").unwrap();

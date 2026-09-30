@@ -118,6 +118,9 @@ async fn disconnect_during_startup_cancels_and_converges_to_stopped() {
         &ipc::Request::Run {
             model: "model".into(),
             name: Some("cancelled".into()),
+            gpu: None,
+            policy: None,
+            continuity_target_ms: None,
         },
     )
     .await

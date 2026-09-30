@@ -31,6 +31,7 @@ const MIGRATIONS: &[Migration] = &[
     migrate_v6_profiles,
     migrate_v7_checkpoints,
     migrate_v8_handoffs,
+    migrate_v9_continuity,
 ];
 
 pub(crate) fn run(conn: &Connection) -> Result<(), StorageError> {
@@ -129,6 +130,34 @@ fn migrate_v8_handoffs(conn: &Connection) -> Result<(), StorageError> {
     Ok(())
 }
 
+/// A session's continuity preference (RALPH continuity phase 4): `ADD COLUMN` with a
+/// `DEFAULT` is SQLite-atomic and never rewrites existing rows, unlike
+/// `migrate_v1_nullable_model_revision`'s rebuild.
+fn migrate_v9_continuity(conn: &Connection) -> Result<(), StorageError> {
+    if !table_exists(conn, "sessions")? {
+        return Ok(()); // brand-new database: `Storage::open`'s fresh `SCHEMA` already has these columns
+    }
+    // `migrate_v1_nullable_model_revision`'s rebuild uses the *current* `SCHEMA` text,
+    // so a database that went through that rebuild already has these columns by the
+    // time this migration runs — `ADD COLUMN` on an already-present column is a hard
+    // SQLite error, unlike `CREATE TABLE IF NOT EXISTS`.
+    let has_column: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM pragma_table_info('sessions') WHERE name = 'continuity_policy'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if has_column.is_some() {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "ALTER TABLE sessions ADD COLUMN continuity_policy TEXT NOT NULL DEFAULT 'warm';
+         ALTER TABLE sessions ADD COLUMN continuity_target_ms INTEGER;",
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,6 +222,32 @@ mod tests {
     fn fresh_database_has_no_sessions_table_to_migrate() {
         let conn = Connection::open_in_memory().unwrap();
         run(&conn).unwrap(); // must not error just because the table doesn't exist yet
+    }
+
+    /// Regression: `migrate_v1_nullable_model_revision`'s rebuild uses the *current*
+    /// `SCHEMA` text (already carrying `continuity_policy`), so by the time
+    /// `migrate_v9_continuity` runs on a database that went through v1, the columns are
+    /// already there — its own `ADD COLUMN` must detect that and skip, not error.
+    #[test]
+    fn a_pre_v1_database_ends_up_with_exactly_one_continuity_policy_column() {
+        let conn = old_schema_db_with_one_row();
+        run(&conn).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('sessions') WHERE name = 'continuity_policy'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        let policy: String = conn
+            .query_row(
+                "SELECT continuity_policy FROM sessions WHERE id = '01AAA'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(policy, "warm");
     }
 
     #[test]

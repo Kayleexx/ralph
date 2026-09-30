@@ -21,8 +21,8 @@ async fn checkpoint_requires_an_active_session() {
     ));
 }
 
-/// Unlike pause, a checkpoint write failure must not block hibernation — §16.7
-/// "Hibernation cannot save acceleration state" explicitly allows logical-only.
+/// Unlike pause, a checkpoint write failure must not block hibernation — hibernation is
+/// allowed to go logical-only when acceleration state can't be saved.
 #[tokio::test]
 async fn hibernate_succeeds_even_when_the_checkpoint_write_fails() {
     let dir = tempfile::tempdir().unwrap();
@@ -100,12 +100,12 @@ async fn pause_rolls_back_to_active_when_disk_is_full() {
     ));
     assert_eq!(daemon.inspect("demo").unwrap().session.state, "active");
     assert!(
-        daemon.workers.lock().await.contains_key("model"),
+        daemon.workers.lock().await.contains_key(&wk("model")),
         "worker must stay attached: nothing was released"
     );
 }
 
-/// §16.7 "hibernation cannot save acceleration state" — a full disk degrades to
+/// Hibernation cannot always save acceleration state — a full disk degrades to
 /// logical-only, it never blocks the GPU release the way `pause` fails closed.
 #[tokio::test]
 async fn hibernate_continues_logical_only_when_disk_is_full() {
@@ -120,6 +120,27 @@ async fn hibernate_continues_logical_only_when_disk_is_full() {
     let hibernated = daemon.hibernate_cancellable("demo", None).await.unwrap();
     assert_eq!(hibernated.state, "hibernated");
     assert!(daemon.workers.lock().await.is_empty());
+}
+
+/// A checkpoint must not interleave with an in-flight generation on the same session —
+/// both go through the same per-session lock `begin_query` already holds.
+#[tokio::test]
+async fn checkpoint_fails_while_a_query_is_in_flight() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = test_daemon(dir.path());
+    daemon
+        .run("model".to_string(), Some("demo".to_string()))
+        .await
+        .unwrap();
+    let guard = daemon.begin_query("demo", "hello").await.unwrap();
+
+    assert!(matches!(
+        daemon.checkpoint("demo").await,
+        Err(CliError::InvalidState(_))
+    ));
+
+    drop(guard);
+    daemon.checkpoint("demo").await.unwrap();
 }
 
 /// A present, fingerprint-compatible checkpoint whose bytes are actually garbage fails

@@ -30,7 +30,12 @@ pub async fn run_export(
         force,
         with_accel,
     };
-    match client::send_request(&mut stream, &request).await {
+    let result = if !cli.json && !cli.quiet {
+        send_with_progress(&mut stream, &request, "exporting").await
+    } else {
+        client::send_request(&mut stream, &request).await
+    };
+    match result {
         Ok(Response::Run(info)) => {
             if cli.json {
                 print_json(&serde_json::json!({
@@ -65,7 +70,12 @@ pub async fn run_import(home: &Path, cli: Flags, path: String, name: Option<Stri
         path: path.to_string_lossy().into_owned(),
         name,
     };
-    match client::send_request(&mut stream, &request).await {
+    let result = if !cli.json && !cli.quiet {
+        send_with_progress(&mut stream, &request, "importing").await
+    } else {
+        client::send_request(&mut stream, &request).await
+    };
+    match result {
         Ok(Response::Run(info)) => {
             if cli.json {
                 print_json(&info);

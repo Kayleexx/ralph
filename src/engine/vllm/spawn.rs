@@ -63,6 +63,10 @@ pub(super) fn vllm_serve_args(
         "--enforce-eager".to_string(),
         // Preserve the existing idle sleep lifecycle.
         "--enable-sleep-mode".to_string(),
+        // Explicit rather than relying on vLLM's own default (`None`, resolved
+        // internally) — an intentional Ralph decision to reuse matching-prefix KV
+        // blocks in VRAM across requests, separate from the disk-offload tier below.
+        "--enable-prefix-caching".to_string(),
     ];
     // Explicit KV bypasses automatic sizing; utilization still gates startup in vLLM.
     if let Some(profile) = profile {

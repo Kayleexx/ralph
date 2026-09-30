@@ -42,11 +42,13 @@ pub async fn run_recover(home: &Path, cli: Flags, session: String) -> i32 {
         Err(code) => return code,
     };
     let request = Request::Recover { session };
+    let start = Instant::now();
     let result = if !cli.json && !cli.quiet && std::io::stdout().is_terminal() {
         send_with_progress(&mut stream, &request, "recovering").await
     } else {
         client::send_request(&mut stream, &request).await
     };
+    let elapsed = start.elapsed();
     match result {
         Ok(Response::Run(info)) => {
             if cli.json {
@@ -55,9 +57,10 @@ pub async fn run_recover(home: &Path, cli: Flags, session: String) -> i32 {
                 println!("{}", info.name);
             } else {
                 println!(
-                    "{} {} recovered",
+                    "{} {} recovered in {:.1}s",
                     style(cli, "32", ok_mark(cli)),
-                    style(cli, "1", &info.name)
+                    style(cli, "1", &info.name),
+                    elapsed.as_secs_f64()
                 );
                 println!(
                     "  model: {}",

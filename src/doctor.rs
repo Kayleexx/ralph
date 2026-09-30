@@ -71,13 +71,26 @@ fn check_data_dir(ralph_home: &Path) -> CheckResult {
             "data directory",
             format!("{} exists but is not a directory", ralph_home.display()),
         ),
-        Err(_) => pass(
-            "data directory",
-            format!(
-                "{} does not exist yet; created on first run",
-                ralph_home.display()
-            ),
-        ),
+        Err(_) => {
+            let ancestor = nearest_existing_ancestor(ralph_home);
+            match std::fs::metadata(ancestor) {
+                Ok(meta) if meta.permissions().mode() & 0o200 != 0 => pass(
+                    "data directory",
+                    format!(
+                        "{} does not exist yet; created on first run",
+                        ralph_home.display()
+                    ),
+                ),
+                _ => fail(
+                    "data directory",
+                    format!(
+                        "{} does not exist and {} is not writable; first run would fail",
+                        ralph_home.display(),
+                        ancestor.display()
+                    ),
+                ),
+            }
+        }
     }
 }
 
@@ -147,7 +160,14 @@ fn check_vllm_binary() -> CheckResult {
             "vllm",
             format!("{} --version exited with {}", bin.display(), output.status),
         ),
-        Err(e) => fail("vllm", format!("cannot run {}: {e}", bin.display())),
+        Err(e) => fail(
+            "vllm",
+            format!(
+                "cannot run {}: {e}; install it: python3 -m venv .venv && \
+                 .venv/bin/pip install vllm",
+                bin.display()
+            ),
+        ),
     }
 }
 
@@ -185,21 +205,47 @@ fn free_vram_mib() -> Option<u64> {
     String::from_utf8_lossy(&output.stdout).trim().parse().ok()
 }
 
+/// Per-index free VRAM — placement decisions (Stage C's migration work) need to know
+/// which of several GPUs has headroom, not just the aggregate `free_vram_mib` reports.
+fn free_vram_mib_for(index: u32) -> Option<u64> {
+    let output = Command::new("nvidia-smi")
+        .arg(format!("--id={index}"))
+        .args(["--query-gpu=memory.free", "--format=csv,noheader,nounits"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout).trim().parse().ok()
+}
+
 fn check_gpu() -> CheckResult {
     match gpu_count() {
-        Some(count) if count > 0 => match free_vram_mib() {
-            Some(free) if free < LOW_FREE_VRAM_MIB => warn(
-                "gpu",
-                format!(
-                    "{count} gpu(s) visible, only {free} MiB free; check for leftover \
-                     worker processes with: nvidia-smi --query-compute-apps=pid,used_memory,process_name --format=csv"
+        Some(count) if count > 0 => {
+            let per_index: Vec<String> = (0..count as u32)
+                .map(|i| match free_vram_mib_for(i) {
+                    Some(free) => format!("gpu{i}: {free} MiB free"),
+                    None => format!("gpu{i}: unreadable"),
+                })
+                .collect();
+            let detail = per_index.join(", ");
+            match free_vram_mib() {
+                Some(free) if free < LOW_FREE_VRAM_MIB => warn(
+                    "gpu",
+                    format!(
+                        "{count} gpu(s) visible ({detail}), only {free} MiB free in total; \
+                         check for leftover worker processes with: nvidia-smi \
+                         --query-compute-apps=pid,used_memory,process_name --format=csv"
+                    ),
                 ),
-            ),
-            Some(free) => pass("gpu", format!("{count} gpu(s) visible, {free} MiB free")),
-            None => pass("gpu", format!("{count} gpu(s) visible")),
-        },
+                _ => pass("gpu", format!("{count} gpu(s) visible ({detail})")),
+            }
+        }
         Some(_) => fail("gpu", "nvidia-smi reported no gpus"),
-        None => fail("gpu", "cannot run nvidia-smi"),
+        None => fail(
+            "gpu",
+            "cannot run nvidia-smi; install the NVIDIA driver (Ralph needs a real CUDA GPU)",
+        ),
     }
 }
 
@@ -244,6 +290,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let result = check_data_dir(dir.path());
         assert_eq!(result.status, "pass");
+    }
+
+    /// Regression: a missing `ralph_home` used to always report "pass — created on
+    /// first run" even when its parent isn't actually writable, silently promising a
+    /// first run that would fail.
+    #[test]
+    fn data_dir_check_fails_when_the_creatable_parent_is_not_writable() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        let target = dir.path().join("ralph_home");
+        let result = check_data_dir(&target);
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(result.status, "fail");
     }
 
     #[test]

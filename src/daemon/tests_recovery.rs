@@ -21,7 +21,7 @@ async fn worker_crash_demotes_every_attached_session_to_recovering() {
 
     let exited = {
         let workers = daemon.workers.lock().await;
-        let entry = workers.get("shared-model").unwrap();
+        let entry = workers.get(&wk("shared-model")).unwrap();
         entry.engine.lock().await.exited.clone()
     };
     exited.store(true, Ordering::SeqCst);
@@ -30,7 +30,12 @@ async fn worker_crash_demotes_every_attached_session_to_recovering() {
     assert_eq!(daemon.inspect("a").unwrap().session.state, "recovering");
     assert_eq!(daemon.inspect("b").unwrap().session.state, "recovering");
     assert!(
-        daemon.workers.lock().await.get("shared-model").is_some(),
+        daemon
+            .workers
+            .lock()
+            .await
+            .get(&wk("shared-model"))
+            .is_some(),
         "the bounded automatic restart should have brought a fresh worker up"
     );
 
@@ -38,9 +43,38 @@ async fn worker_crash_demotes_every_attached_session_to_recovering() {
     assert_eq!(recovered.state, "active");
 }
 
+/// A session left `Active`-but-sleeping (idle-supervisor path, not `Pausing`/
+/// `Hibernating`) must demote to `Recovering` on daemon restart exactly like any other
+/// `Active` session — `reconcile_after_restart`'s unconditional `Active|Starting
+/// -> Recovering` demotion doesn't special-case sleep state, so nothing about being
+/// asleep should trip it up.
+#[tokio::test]
+async fn daemon_restart_while_worker_is_sleeping_demotes_to_recovering_and_recovers() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = test_daemon(dir.path());
+    daemon
+        .run("model".to_string(), Some("demo".to_string()))
+        .await
+        .unwrap();
+
+    {
+        let workers = daemon.workers.lock().await;
+        let entry = workers.get(&wk("model")).unwrap();
+        entry.engine.lock().await.sleep().await.unwrap();
+        assert!(entry.engine.lock().await.is_sleeping().await);
+    }
+    assert_eq!(daemon.inspect("demo").unwrap().session.state, "active");
+
+    daemon.reconcile_on_startup().unwrap();
+    assert_eq!(daemon.inspect("demo").unwrap().session.state, "recovering");
+
+    let recovered = daemon.recover("demo").await.unwrap();
+    assert_eq!(recovered.state, "active");
+}
+
 /// A worker that can never come back up (every cold-start attempt fails) must still
 /// converge to a terminal, non-looping outcome — `Stopped`, not an infinite retry loop,
-/// and not `Failed` (a worker crash is never a session failure, Invariant 5).
+/// and not `Failed` (a worker crash is never a session failure).
 #[tokio::test]
 async fn repeated_crash_converges_to_stopped_without_looping_forever() {
     let dir = tempfile::tempdir().unwrap();
@@ -69,16 +103,13 @@ async fn repeated_crash_converges_to_stopped_without_looping_forever() {
             token_count: 0,
             created_at: now.clone(),
             updated_at: now,
+            continuity_policy: crate::continuity::ContinuityPolicy::default(),
+            continuity_target_ms: None,
         })
         .unwrap();
 
-    recovery::handle_worker_loss(
-        &daemon,
-        "broken-model".to_string(),
-        vec!["01AAA".to_string()],
-        None,
-    )
-    .await;
+    recovery::handle_worker_loss(&daemon, wk("broken-model"), vec!["01AAA".to_string()], None)
+        .await;
 
     assert_eq!(daemon.inspect("demo").unwrap().session.state, "stopped");
 
@@ -102,7 +133,7 @@ async fn crash_before_any_query_recovers_with_empty_history() {
     let exited = {
         let workers = daemon.workers.lock().await;
         workers
-            .get("model")
+            .get(&wk("model"))
             .unwrap()
             .engine
             .lock()
@@ -140,7 +171,7 @@ async fn crash_after_a_flushed_turn_replays_it_after_recovery() {
     let exited = {
         let workers = daemon.workers.lock().await;
         workers
-            .get("model")
+            .get(&wk("model"))
             .unwrap()
             .engine
             .lock()
@@ -231,11 +262,17 @@ async fn immediate_replacement_crashes_share_one_retry_budget() {
         .await
         .unwrap();
     for _ in 0..4 {
-        let engine = daemon.workers.lock().await.remove("model").unwrap().engine;
+        let engine = daemon
+            .workers
+            .lock()
+            .await
+            .remove(&wk("model"))
+            .unwrap()
+            .engine;
         engine.lock().await.stop_model().await.unwrap();
         tokio::time::timeout(
             Duration::from_secs(3),
-            recovery::handle_worker_loss(&daemon, "model".into(), vec![info.id.clone()], None),
+            recovery::handle_worker_loss(&daemon, wk("model"), vec![info.id.clone()], None),
         )
         .await
         .unwrap();
@@ -245,7 +282,7 @@ async fn immediate_replacement_crashes_share_one_retry_budget() {
     assert!(daemon.workers.lock().await.is_empty());
 }
 
-/// Regression test for GC (§16.15 storage cleanup): a leftover `handoff-recv-*.ralph`
+/// Regression test for startup GC: a leftover `handoff-recv-*.ralph`
 /// staging file and a session directory whose row never made it to `insert` (the
 /// crash-mid-`import` window) are both orphans by the time a fresh daemon boots — the
 /// live session's own directory must survive the same sweep untouched.
@@ -292,7 +329,7 @@ async fn wait_for_replacement(daemon: &Arc<Daemon<FakeEngine>>, session: &str, m
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             if daemon.inspect(session).unwrap().session.state != "active"
-                && daemon.workers.lock().await.contains_key(model)
+                && daemon.workers.lock().await.contains_key(&wk(model))
             {
                 return;
             }

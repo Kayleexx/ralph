@@ -13,9 +13,8 @@ use crate::error::CliError;
 use crate::ipc::{DrainOutcome, DrainReport};
 use crate::state::SessionState;
 
-/// `SessionRow.location` is always stored as `"local/gpu0"`; RALPH_SPEC.md's own
-/// examples call the same thing just `gpu0` (`ralph drain gpu0`) — accept either the
-/// exact stored value or its bare GPU suffix.
+/// `SessionRow.location` is stored as `"local/gpu<N>"`, but `ralph drain gpu0` names
+/// just the bare GPU — accept either the exact stored value or its bare GPU suffix.
 fn location_matches(stored: &str, requested: &str) -> bool {
     stored == requested || stored.rsplit('/').next() == Some(requested)
 }
@@ -57,7 +56,7 @@ impl<E: Engine + 'static> Daemon<E> {
 
         // Moving a session off-machine is treated as the destructive/irreversible
         // variant regardless of count; a multi-session hibernate-only drain is printed
-        // first either way (RALPH_SPEC.md §7.2's drain example).
+        // first either way.
         let requires_confirmation = to.is_some() || plan.len() > 1;
         if requires_confirmation && !yes {
             let sessions = plan

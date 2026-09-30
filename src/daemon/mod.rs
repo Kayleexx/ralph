@@ -8,10 +8,11 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
+use crate::continuity::ContinuityPolicy;
 use crate::doctor;
 use crate::engine::{ChatMessage, Engine, EngineError, ResolvedModel};
 use crate::error::CliError;
-use crate::ipc::{InspectInfo, SessionInfo};
+use crate::ipc::SessionInfo;
 use crate::lock::SessionLocks;
 use crate::session;
 use crate::state::{self, SessionState};
@@ -19,10 +20,13 @@ use crate::storage::{SessionRow, Storage};
 
 mod admission;
 mod checkpoint;
+mod continuity;
 pub(crate) mod drain;
 pub(crate) mod handoff;
 mod idle;
+mod inspect;
 pub(crate) mod lifecycle;
+pub(crate) mod migrate;
 mod portable;
 mod query;
 mod recovery;
@@ -42,6 +46,8 @@ mod tests_handoff;
 #[cfg(test)]
 mod tests_lifecycle;
 #[cfg(test)]
+mod tests_migrate;
+#[cfg(test)]
 mod tests_portable;
 #[cfg(test)]
 mod tests_recovery;
@@ -54,8 +60,16 @@ const SUPERVISOR_POLL_INTERVAL: Duration = Duration::from_millis(500);
 // is keyed on activity, not on the attached-session count reaching zero.
 const IDLE_SLEEP_AFTER: Duration = Duration::from_secs(300);
 
-/// One worker per model id. Attachment checks the resolved model/tokenizer revision
-/// before sharing it with a historical session.
+/// One worker per (model id, GPU index). Two sessions on the same model but different
+/// GPUs must never share a worker — this pair is the whole of worker identity.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct WorkerKey {
+    model: String,
+    gpu: u32,
+}
+
+/// Attachment checks the resolved model/tokenizer revision before sharing it with a
+/// historical session.
 struct WorkerEntry<E: Engine> {
     engine: Arc<AsyncMutex<E>>,
     resolved: ResolvedModel,
@@ -88,12 +102,12 @@ pub struct Daemon<E: Engine + 'static> {
     storage: SyncMutex<Storage>,
     sessions_root: PathBuf,
     locks: SessionLocks,
-    // Keyed by model id, not session id — see `WorkerEntry`.
-    workers: AsyncMutex<HashMap<String, WorkerEntry<E>>>,
+    // Keyed by (model id, gpu index), not session id — see `WorkerKey`/`WorkerEntry`.
+    workers: AsyncMutex<HashMap<WorkerKey, WorkerEntry<E>>>,
     startup: AsyncMutex<()>,
     make_engine: fn(PathBuf) -> E,
     has_gpu: fn() -> bool,
-    gpu_memory: fn() -> Result<admission::GpuMemory, CliError>,
+    gpu_memory: fn(u32) -> Result<admission::GpuMemory, CliError>,
     /// Set for the duration of one `ralph drain` call, naming the location being
     /// drained — this codebase is single-GPU only, so any drain blocks every new
     /// admission system-wide until it returns (`drain::drain_cancellable`,
@@ -103,9 +117,16 @@ pub struct Daemon<E: Engine + 'static> {
     /// tests point this at a fake script so handoff/drain tests never touch the network.
     ssh_program: SyncMutex<String>,
     /// Forces `lifecycle::has_checkpoint_room` to report no space, for deterministic
-    /// disk-full tests (RALPH_SPEC.md §16.15 "fill checkpoint disk") without needing to
-    /// actually exhaust a filesystem. `false` (real check) in production.
+    /// disk-full tests without needing to actually exhaust a filesystem. `false` (real
+    /// check) in production.
     force_disk_full: SyncMutex<bool>,
+    /// (demoted session name, MiB freed) from the most recent `continuity::make_room`,
+    /// taken by `run_cancellable` right after a successful admission. Admission is
+    /// already fully serialized by `startup`'s lock (`make_room` only ever runs while
+    /// it's held), so one shared slot is safe — the same pattern `draining` already uses
+    /// to signal across the call stack without threading a return value through every
+    /// intermediate layer.
+    last_make_room: SyncMutex<Option<(String, u64)>>,
 }
 
 fn real_gpu_check() -> bool {
@@ -138,6 +159,7 @@ impl<E: Engine + 'static> Daemon<E> {
             draining: SyncMutex::new(None),
             ssh_program: SyncMutex::new("ssh".to_string()),
             force_disk_full: SyncMutex::new(false),
+            last_make_room: SyncMutex::new(None),
         })
     }
 
@@ -175,13 +197,17 @@ impl<E: Engine + 'static> Daemon<E> {
         model: String,
         name: Option<String>,
     ) -> Result<SessionInfo, CliError> {
-        self.run_cancellable(model, name, None).await
+        self.run_cancellable(model, name, 0, ContinuityPolicy::default(), None, None)
+            .await
     }
 
     pub async fn run_cancellable(
         self: &Arc<Self>,
         model: String,
         name: Option<String>,
+        gpu: u32,
+        continuity_policy: ContinuityPolicy,
+        continuity_target_ms: Option<i64>,
         mut cancel: Option<tokio::sync::oneshot::Receiver<()>>,
     ) -> Result<SessionInfo, CliError> {
         if !(self.has_gpu)() {
@@ -206,10 +232,12 @@ impl<E: Engine + 'static> Daemon<E> {
             engine_version: None,
             state: SessionState::Created,
             pid: None,
-            location: "local/gpu0".to_string(),
+            location: session::location_for(gpu),
             token_count: 0,
             created_at: now.clone(),
             updated_at: now,
+            continuity_policy,
+            continuity_target_ms,
         };
         self.storage().insert(&row)?;
         session::create_session_dir(&self.sessions_root, &row)
@@ -217,7 +245,7 @@ impl<E: Engine + 'static> Daemon<E> {
         self.transition(&id, SessionState::Created, SessionState::Starting, None)?;
 
         match self
-            .attach_or_start_worker(&model, &id, &mut cancel, true)
+            .attach_or_start_worker(&model, &id, &mut cancel, true, gpu)
             .await
         {
             Ok((_, resolved, pid)) => {
@@ -228,7 +256,14 @@ impl<E: Engine + 'static> Daemon<E> {
                     &now_rfc3339(),
                 )?;
                 self.transition(&id, SessionState::Starting, SessionState::Active, pid)?;
-                Ok(to_session_info(&self.storage().resolve(&id)?))
+                let made_room_for = self
+                    .last_make_room
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take();
+                let mut info = to_session_info(&self.storage().resolve(&id)?);
+                info.made_room_for = made_room_for.map(|(name, _)| name);
+                Ok(info)
             }
             Err(e) => {
                 self.transition(&id, SessionState::Starting, SessionState::Stopped, None)?;
@@ -244,7 +279,7 @@ impl<E: Engine + 'static> Daemon<E> {
     /// for every attached session (never `Failed` directly: a worker crash is not a
     /// session failure) — and puts it to sleep after `IDLE_SLEEP_AFTER` with no query
     /// against any of its sessions.
-    fn spawn_worker_supervisor(self: &Arc<Self>, model: String, handle: Arc<AsyncMutex<E>>) {
+    fn spawn_worker_supervisor(self: &Arc<Self>, key: WorkerKey, handle: Arc<AsyncMutex<E>>) {
         let daemon = self.clone();
         tokio::spawn(async move {
             loop {
@@ -258,7 +293,7 @@ impl<E: Engine + 'static> Daemon<E> {
                     .workers
                     .lock()
                     .await
-                    .get(&model)
+                    .get(&key)
                     .map(|e| e.last_active.elapsed() >= IDLE_SLEEP_AFTER)
                     .unwrap_or(false);
                 if idle {
@@ -268,7 +303,7 @@ impl<E: Engine + 'static> Daemon<E> {
                         .workers
                         .lock()
                         .await
-                        .get(&model)
+                        .get(&key)
                         .is_some_and(|e| e.last_active.elapsed() >= IDLE_SLEEP_AFTER);
                     if !still_idle {
                         continue;
@@ -290,57 +325,23 @@ impl<E: Engine + 'static> Daemon<E> {
             let (session_ids, kv_engine_id) = {
                 let mut workers = daemon.workers.lock().await;
                 if workers
-                    .get(&model)
+                    .get(&key)
                     .is_some_and(|entry| Arc::ptr_eq(&entry.engine, &handle))
                 {
-                    let entry = workers.remove(&model).unwrap();
+                    let entry = workers.remove(&key).unwrap();
                     (entry.session_ids, entry.kv_engine_id)
                 } else {
                     (Vec::new(), None)
                 }
             };
             drop(startup);
-            recovery::handle_worker_loss(&daemon, model, session_ids, kv_engine_id).await;
+            recovery::handle_worker_loss(&daemon, key, session_ids, kv_engine_id).await;
         });
     }
 
     #[cfg(test)]
     pub(crate) fn inject_storage_fault(&self, sql: &str) {
         self.storage().test_execute(sql);
-    }
-
-    pub fn ps(&self) -> Result<Vec<SessionInfo>, CliError> {
-        Ok(self.storage().list()?.iter().map(to_session_info).collect())
-    }
-
-    pub fn inspect(&self, identifier: &str) -> Result<InspectInfo, CliError> {
-        let row = self.storage().resolve(identifier)?;
-        let history = self.storage().replay_turns(&row.id);
-        let complete = history
-            .as_ref()
-            .is_ok_and(|messages| row.token_count == 0 || !messages.is_empty());
-        let recoverability = match row.state {
-            SessionState::Active | SessionState::Created | SessionState::Starting => "safe",
-            SessionState::Failed => "broken",
-            _ => "degraded",
-        };
-        let fast_restore = if self.kv_offload_for(&row).is_some() {
-            "available"
-        } else {
-            "unavailable"
-        };
-        let moved_to = self
-            .storage()
-            .get_handoff(&row.id)?
-            .map(|h| format!("{} as {}", h.destination, h.remote_name));
-        Ok(InspectInfo {
-            session: to_session_info(&row),
-            recoverability: if complete { recoverability } else { "degraded" }.to_string(),
-            fast_restore: fast_restore.to_string(),
-            last_failure: self.storage().last_worker_failure(&row.model)?,
-            portable_state: if complete { "complete" } else { "incomplete" }.to_string(),
-            moved_to,
-        })
     }
 }
 
@@ -355,6 +356,7 @@ fn to_session_info(row: &SessionRow) -> SessionInfo {
         pid: row.pid,
         location: row.location.clone(),
         token_count: row.token_count,
+        made_room_for: None,
     }
 }
 

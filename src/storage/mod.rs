@@ -9,13 +9,13 @@ use std::path::Path;
 use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
 
+use crate::continuity::ContinuityPolicy;
 use crate::state::SessionState;
-use crate::typo::suggest_similar;
-
 pub mod checkpoints;
 pub mod handoff;
 mod migrate;
 mod profiles;
+mod resolve;
 mod restarts;
 #[cfg(test)]
 mod tests;
@@ -81,6 +81,10 @@ pub struct SessionRow {
     pub token_count: i64,
     pub created_at: String,
     pub updated_at: String,
+    pub continuity_policy: ContinuityPolicy,
+    /// `ralph run --continuity-target <ms>` — a hint, not a guarantee (RALPH continuity
+    /// phase 4): how fast this session's owner wants it restorable if demoted.
+    pub continuity_target_ms: Option<i64>,
 }
 
 pub struct Storage {
@@ -100,7 +104,9 @@ const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS sessions (
     location            TEXT NOT NULL DEFAULT 'local/gpu0',
     token_count         INTEGER NOT NULL DEFAULT 0,
     created_at          TEXT NOT NULL,
-    updated_at          TEXT NOT NULL
+    updated_at          TEXT NOT NULL,
+    continuity_policy   TEXT NOT NULL DEFAULT 'warm',
+    continuity_target_ms INTEGER
 )";
 
 impl Storage {
@@ -159,8 +165,9 @@ impl Storage {
         let inserted = tx.execute(
             "INSERT INTO sessions (
                 id, name, model, model_revision, tokenizer_revision, engine, engine_version,
-                state, pid, location, token_count, created_at, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                state, pid, location, token_count, created_at, updated_at,
+                continuity_policy, continuity_target_ms
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 row.id,
                 row.name,
@@ -175,6 +182,8 @@ impl Storage {
                 row.token_count,
                 row.created_at,
                 row.updated_at,
+                row.continuity_policy.to_string(),
+                row.continuity_target_ms,
             ],
         );
         match inserted {
@@ -231,6 +240,23 @@ impl Storage {
         Ok(())
     }
 
+    /// Written only after a migration's destination worker is fully attached and primed
+    /// — the commit point `daemon::migrate` relies on for crash-safe rollback.
+    pub fn set_location(
+        &self,
+        id: &str,
+        location: &str,
+        updated_at: &str,
+    ) -> Result<(), StorageError> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "UPDATE sessions SET location = ?1, updated_at = ?2 WHERE id = ?3",
+            params![location, updated_at, id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Bumps only `updated_at`, so per-session idle tracking (`daemon::idle`) reflects
     /// real query activity, not just state transitions.
     pub fn touch(&self, id: &str, updated_at: &str) -> Result<(), StorageError> {
@@ -252,66 +278,6 @@ impl Storage {
 
     /// Resolves a session by exact name, exact ID, or a unique ID prefix — never a fuzzy
     /// match.
-    pub fn resolve(&self, identifier: &str) -> Result<SessionRow, StorageError> {
-        if let Some(row) = self.find_by_name(identifier)? {
-            return Ok(row);
-        }
-        if let Some(row) = self.find_by_id(identifier)? {
-            return Ok(row);
-        }
-        let matches = self.find_by_id_prefix(identifier)?;
-        match matches.len() {
-            0 => {
-                let names = self.list()?.into_iter().map(|r| r.name).collect::<Vec<_>>();
-                let suggestion = suggest_similar(identifier, names.iter().map(String::as_str));
-                Err(StorageError::NotFound {
-                    identifier: identifier.to_string(),
-                    suggestion,
-                })
-            }
-            1 => matches
-                .into_iter()
-                .next()
-                .ok_or_else(|| StorageError::Corrupt("session resolution lost its match".into())),
-            _ => Err(StorageError::AmbiguousPrefix(
-                identifier.to_string(),
-                matches.into_iter().map(|r| r.name).collect(),
-            )),
-        }
-    }
-
-    fn find_by_name(&self, name: &str) -> Result<Option<SessionRow>, StorageError> {
-        self.conn
-            .query_row(
-                "SELECT * FROM sessions WHERE name = ?1",
-                params![name],
-                row_to_session,
-            )
-            .optional()
-            .map_err(StorageError::from)
-    }
-
-    fn find_by_id(&self, id: &str) -> Result<Option<SessionRow>, StorageError> {
-        self.conn
-            .query_row(
-                "SELECT * FROM sessions WHERE id = ?1",
-                params![id],
-                row_to_session,
-            )
-            .optional()
-            .map_err(StorageError::from)
-    }
-
-    fn find_by_id_prefix(&self, prefix: &str) -> Result<Vec<SessionRow>, StorageError> {
-        let pattern = format!("{prefix}%");
-        let mut stmt = self
-            .conn
-            .prepare("SELECT * FROM sessions WHERE id LIKE ?1")?;
-        let rows = stmt.query_map(params![pattern], row_to_session)?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(StorageError::from)
-    }
-
     /// Any session left in `Starting`, or `Active` with no currently-live worker, is
     /// demoted to `to` (never left pretending to be usable) — called on daemon startup to
     /// reconcile state after a crash or reboot.
@@ -344,7 +310,7 @@ impl Storage {
     /// state, and by the time this runs, `ownership::reconcile` has already killed any
     /// worker process the previous daemon still had running, so which stable state we
     /// land in is always safe regardless of exactly how far the interrupted operation
-    /// got (Phase 7 gate 1's rollback-completeness audit, `state.rs`'s in-transit test):
+    /// got (see `state.rs`'s in-transit-state tests for the completeness proof):
     /// `Moving` (handoff/drain never actually left this machine until its final commit)
     /// and `Resuming` both land in `Paused`; `Pausing`/`Hibernating` land in the state
     /// they were already about to reach. This daemon process starts with no in-memory
@@ -370,9 +336,13 @@ impl Storage {
     }
 }
 
-fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow> {
+pub(super) fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow> {
     let state_str: String = row.get("state")?;
     let state = state_str.parse::<SessionState>().map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    })?;
+    let policy_str: String = row.get("continuity_policy")?;
+    let continuity_policy = policy_str.parse::<ContinuityPolicy>().map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
     })?;
     Ok(SessionRow {
@@ -389,5 +359,7 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow> {
         token_count: row.get("token_count")?,
         created_at: row.get("created_at")?,
         updated_at: row.get("updated_at")?,
+        continuity_policy,
+        continuity_target_ms: row.get("continuity_target_ms")?,
     })
 }

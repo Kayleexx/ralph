@@ -1,7 +1,7 @@
 //! `ralph pause`/`resume`/`hibernate`. `checkpoint.rs` owns the checkpoint pointer
 //! itself and the disk-quota/fingerprint bookkeeping around it; this module is the
-//! session-lifecycle transitions layered on top of Phase 2's worker-attach/session-lock
-//! machinery.
+//! session-lifecycle transitions layered on top of the worker-attach/session-lock
+//! machinery elsewhere in this module tree.
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -36,13 +36,17 @@ impl<E: Engine + 'static> Daemon<E> {
     /// worker identically, differing only in what happens to the checkpoint pointer and
     /// which terminal state they land in.
     pub(super) async fn release_worker(&self, row: &SessionRow) -> Result<(), CliError> {
+        let key = super::WorkerKey {
+            model: row.model.clone(),
+            gpu: crate::session::gpu_index_of(&row.location),
+        };
         let stop_engine = {
             let mut workers = self.workers.lock().await;
-            match workers.get_mut(&row.model) {
+            match workers.get_mut(&key) {
                 Some(entry) => {
                     entry.session_ids.retain(|id| id != &row.id);
                     if entry.session_ids.is_empty() {
-                        workers.remove(&row.model).map(|removed| removed.engine)
+                        workers.remove(&key).map(|removed| removed.engine)
                     } else {
                         None
                     }
@@ -83,8 +87,8 @@ impl<E: Engine + 'static> Daemon<E> {
         }
         self.transition(&row.id, SessionState::Active, SessionState::Pausing, None)?;
 
-        // Durable token history is already flushed continuously (Phase 2); record the
-        // checkpoint pointer before releasing the worker.
+        // Durable token history is already flushed continuously; record the checkpoint
+        // pointer before releasing the worker.
         self.enforce_kv_quota(&row.id);
         if !self.has_checkpoint_room(&row) {
             self.transition(&row.id, SessionState::Pausing, SessionState::Active, None)?;
@@ -114,10 +118,9 @@ impl<E: Engine + 'static> Daemon<E> {
     }
 
     /// A "stronger pause": same GPU release as `pause_cancellable`, but the checkpoint
-    /// write is best-effort rather than fail-closed — §16.7 "Hibernation cannot save
-    /// acceleration state" explicitly allows a logical-only hibernation when the durable
-    /// token log is already complete, rather than blocking the whole operation on a KV
-    /// write that isn't the source of truth anyway.
+    /// write is best-effort rather than fail-closed — a logical-only hibernation is fine
+    /// when the durable token log is already complete, rather than blocking the whole
+    /// operation on a KV write that isn't the source of truth anyway.
     pub async fn hibernate_cancellable(
         self: &Arc<Self>,
         identifier: &str,
@@ -187,6 +190,7 @@ impl<E: Engine + 'static> Daemon<E> {
             return Ok(ResumeInfo {
                 session: to_session_info(&row),
                 native: false,
+                already_active: true,
             });
         }
         if row.state != SessionState::Paused && row.state != SessionState::Hibernated {
@@ -223,23 +227,21 @@ impl<E: Engine + 'static> Daemon<E> {
                 ));
             }
         };
+        let gpu_index = crate::session::gpu_index_of(&row.location);
         let attach = self
-            .attach_or_start_worker(&row.model, &row.id, &mut cancel, allow_native)
+            .attach_or_start_worker(&row.model, &row.id, &mut cancel, allow_native, gpu_index)
             .await;
         // A present, fingerprint-compatible checkpoint whose content is actually corrupt
         // fails here at engine startup, not at the `kv_offload_for` compatibility gate
         // (which only checks the fingerprint, not the bytes) — retry once portable rather
         // than surfacing a raw engine error for damage `ralph checkpoint` can just redo.
-        let attach = if attach.is_err() && native {
-            eprintln!(
-                "resume: native checkpoint attach failed, retrying portable: {}",
-                attach.as_ref().err().unwrap()
-            );
+        let attach = if native && let Err(error) = &attach {
+            eprintln!("resume: native checkpoint attach failed, retrying portable: {error}");
             native = false;
             // Drop the pointer row so a genuinely corrupt directory isn't retried on
             // every future resume; a later `ralph checkpoint` just writes a fresh one.
             let _ = self.storage().delete_checkpoint(&row.id);
-            self.attach_or_start_worker(&row.model, &row.id, &mut cancel, false)
+            self.attach_or_start_worker(&row.model, &row.id, &mut cancel, false, gpu_index)
                 .await
         } else {
             attach
@@ -279,6 +281,7 @@ impl<E: Engine + 'static> Daemon<E> {
         Ok(ResumeInfo {
             session: to_session_info(&self.storage().resolve(&row.id)?),
             native,
+            already_active: false,
         })
     }
 }

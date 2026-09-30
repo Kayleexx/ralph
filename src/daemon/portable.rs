@@ -195,15 +195,16 @@ impl<E: Engine + 'static> Daemon<E> {
             token_count,
             created_at: parsed.manifest.created_at.clone(),
             updated_at: now.clone(),
+            continuity_policy: crate::continuity::ContinuityPolicy::default(),
+            continuity_target_ms: None,
         };
 
         // Everything below writes under the fresh id `id` before the session row itself
         // exists. No read path (`list`/`resolve`/`ps`) can ever see a session that has no
         // row in `sessions`, so a failure here leaves orphaned-but-invisible data rather
         // than a partially-visible session — `insert`, last, is what actually publishes
-        // it (RALPH_SPEC.md §16.8 "fail without partial visible session"). There is
-        // deliberately no delete-on-failure path: this codebase never deletes durable
-        // session state (see `enforce_kv_quota`'s equivalent rule).
+        // it. There is deliberately no delete-on-failure path: this codebase never
+        // deletes durable session state (see `enforce_kv_quota`'s equivalent rule).
         if let Err(e) = session::create_session_dir(&self.sessions_root, &row) {
             cleanup();
             return Err(CliError::Other(e.into()));

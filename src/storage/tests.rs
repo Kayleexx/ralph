@@ -15,6 +15,8 @@ fn sample_row(id: &str, name: &str) -> SessionRow {
         token_count: 0,
         created_at: "2026-01-01T00:00:00Z".to_string(),
         updated_at: "2026-01-01T00:00:00Z".to_string(),
+        continuity_policy: crate::continuity::ContinuityPolicy::default(),
+        continuity_target_ms: None,
     }
 }
 
@@ -159,7 +161,7 @@ fn reconciliation_demotes_stuck_starting_session() {
     assert_eq!(demoted, vec!["01AAA".to_string()]);
 }
 
-/// §16.15 "force SQLite busy contention": a writer that holds the file lock past
+/// Forced SQLite busy contention: a writer that holds the file lock past
 /// another connection's `busy_timeout` must surface `StorageError::Busy` cleanly, never
 /// panic or silently drop the write — and once released, a retry succeeds normally.
 #[test]

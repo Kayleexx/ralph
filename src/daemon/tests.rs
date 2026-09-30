@@ -133,6 +133,14 @@ pub(crate) fn test_daemon(ralph_home: &std::path::Path) -> Arc<Daemon<FakeEngine
     Daemon::with_gpu_check(storage, ralph_home.to_path_buf(), FakeEngine::new, || true)
 }
 
+/// `WorkerKey` for GPU 0 — every existing test targets the one GPU this machine has.
+pub(super) fn wk(model: &str) -> WorkerKey {
+    WorkerKey {
+        model: model.to_string(),
+        gpu: 0,
+    }
+}
+
 #[tokio::test]
 async fn run_rejects_duplicate_name() {
     let dir = tempfile::tempdir().unwrap();
@@ -307,7 +315,7 @@ async fn begin_query_wakes_a_sleeping_worker() {
 
     let sleeping = {
         let workers = daemon.workers.lock().await;
-        let entry = workers.get("model").unwrap();
+        let entry = workers.get(&wk("model")).unwrap();
         entry.engine.lock().await.sleep().await.unwrap();
         entry.engine.lock().await.sleeping.clone()
     };
