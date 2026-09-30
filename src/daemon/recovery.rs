@@ -1,8 +1,8 @@
 //! Crash detection, bounded automatic restart, and `ralph recover`. A worker crash
 //! demotes its sessions to `Recovering`, not `Stopped` — a worker crash is not a session
-//! failure. The daemon then makes a bounded, contextless attempt to get a
-//! fresh worker running for that model; reattaching a specific session's conversation is
-//! always the explicit, user-driven `ralph recover`, never automatic.
+//! failure. If the bounded automatic restart succeeds, affected sessions go straight
+//! back to `Active`; `ralph recover` (or the same auto-recovery `query`/`chat` do) is
+//! only needed when it doesn't.
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -111,8 +111,9 @@ impl<E: Engine + 'static> Daemon<E> {
             ));
         }
         // This guard reserves startup; registry locks are released before I/O.
+        // `Busy`, not `Resource`: nothing failed, something else already holds this.
         let _startup = self.startup.try_lock().map_err(|_| {
-            CliError::Resource(
+            CliError::Busy(
                 "a worker is starting or attaching; session preserved, retry shortly".into(),
             )
         })?;
@@ -266,6 +267,11 @@ impl<E: Engine + 'static> Daemon<E> {
         let (engine, resolved, pid) = match attach {
             Ok(v) => v,
             Err(e) => {
+                // Busy means someone else is attaching this exact worker right now —
+                // stopping the session would abandon that in-flight attempt for nothing.
+                if matches!(e, CliError::Busy(_)) {
+                    return Err(e.for_session_state(&row.name, &row.model, "recovering"));
+                }
                 self.transition(
                     &row.id,
                     SessionState::Recovering,
@@ -337,11 +343,11 @@ pub(super) async fn handle_worker_loss<E: Engine + 'static>(
     let mut attempt = daemon.storage().restart_attempts(&model).unwrap_or(3);
     let restarted = loop {
         if policy.exhausted(attempt) {
-            break false;
+            break None;
         }
         tokio::time::sleep(policy.backoff_for(attempt)).await;
         let Some(session_id) = session_ids.first() else {
-            break false;
+            break None;
         };
         attempt += 1;
         if let Err(error) = daemon
@@ -349,13 +355,13 @@ pub(super) async fn handle_worker_loss<E: Engine + 'static>(
             .record_restart(&model, attempt, "worker exited")
         {
             eprintln!("cannot persist restart budget: {error}");
-            break false;
+            break None;
         }
         match daemon
             .attach_or_start_worker(&model, session_id, &mut cancel, true, key.gpu)
             .await
         {
-            Ok(_) => break true,
+            Ok((_, _, pid)) => break Some(pid),
             Err(error) => {
                 if let Err(write_error) =
                     daemon
@@ -363,19 +369,32 @@ pub(super) async fn handle_worker_loss<E: Engine + 'static>(
                         .record_restart(&model, attempt, &error.to_string())
                 {
                     eprintln!("cannot persist startup failure: {write_error}");
-                    break false;
+                    break None;
                 }
             }
         }
     };
 
-    if restarted {
+    if let Some(pid) = restarted {
         let mut workers = daemon.workers.lock().await;
         if let Some(entry) = workers.get_mut(&key) {
             for id in &session_ids {
                 if !entry.session_ids.contains(id) {
                     entry.session_ids.push(id.clone());
                 }
+            }
+        }
+        drop(workers);
+        // A live worker exists again, but each session still needs its own state
+        // moved out of `Recovering`, or it stays reported that way forever.
+        for id in &session_ids {
+            let _guard = daemon.locks.acquire(id).await;
+            let row = { daemon.storage().resolve(id) };
+            if matches!(&row, Ok(row) if row.state == SessionState::Recovering)
+                && let Err(error) =
+                    daemon.transition(id, SessionState::Recovering, SessionState::Active, pid)
+            {
+                eprintln!("cannot record automatic recovery: {error}");
             }
         }
     } else {

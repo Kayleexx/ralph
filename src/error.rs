@@ -36,6 +36,11 @@ pub enum CliError {
     AmbiguousPrefix(String, Vec<String>),
     #[error("session is not in a state that allows this: {0}")]
     InvalidState(String),
+    /// Transient, not a real failure: something else already holds the one thing this
+    /// needed, nothing was touched. Distinct from `InvalidState` so callers can skip a
+    /// "give up" state transition only for this retry-safe case.
+    #[error("{0}")]
+    Busy(String),
     #[error("resource unavailable: {0}")]
     Resource(String),
     #[error("persistent state is corrupt: {0}")]
@@ -105,7 +110,7 @@ pub fn exit_code(err: &CliError) -> i32 {
         CliError::SessionOperation { source, .. } => exit_code(source),
         CliError::Usage(_) | CliError::DuplicateName(_) => 2,
         CliError::NotFound { .. } | CliError::AmbiguousPrefix(_, _) => 3,
-        CliError::InvalidState(_) => 4,
+        CliError::InvalidState(_) | CliError::Busy(_) => 4,
         CliError::Resource(_) | CliError::Startup { .. } => 6,
         CliError::Corrupt(_) => 8,
         CliError::Other(_) | CliError::Persistence { .. } => 1,
@@ -197,6 +202,11 @@ pub fn envelope(err: &CliError) -> Envelope {
             summary: "session cannot do this right now".to_string(),
             detail: vec![reason.clone()],
             next: Some("run: ralph ps".to_string()),
+        },
+        CliError::Busy(reason) => Envelope {
+            summary: reason.clone(),
+            detail: vec![],
+            next: None,
         },
         CliError::Startup { summary, .. } => Envelope {
             summary: summary.clone(),

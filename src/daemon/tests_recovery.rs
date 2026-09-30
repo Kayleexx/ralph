@@ -3,11 +3,11 @@ use super::tests_engines::AlwaysFailingEngine;
 use super::*;
 use std::sync::atomic::Ordering;
 
-/// `FakeEngine::start_model` always succeeds, so after a crash the automatic bounded
-/// restart succeeds too — sessions land in `Recovering` (a runnable worker exists again),
-/// not `Stopped`; reattaching *this* session's specific history still needs `recover`.
+/// `FakeEngine::start_model` always succeeds, so the automatic bounded restart succeeds
+/// too — every session sharing that worker lands back `Active` on its own, not just
+/// `Recovering` with a runnable worker nobody told it about.
 #[tokio::test]
-async fn worker_crash_demotes_every_attached_session_to_recovering() {
+async fn worker_crash_demotes_every_attached_session_and_auto_restart_reactivates_them() {
     let dir = tempfile::tempdir().unwrap();
     let daemon = test_daemon(dir.path());
     daemon
@@ -27,20 +27,8 @@ async fn worker_crash_demotes_every_attached_session_to_recovering() {
     exited.store(true, Ordering::SeqCst);
 
     wait_for_replacement(&daemon, "a", "shared-model").await;
-    assert_eq!(daemon.inspect("a").unwrap().session.state, "recovering");
-    assert_eq!(daemon.inspect("b").unwrap().session.state, "recovering");
-    assert!(
-        daemon
-            .workers
-            .lock()
-            .await
-            .get(&wk("shared-model"))
-            .is_some(),
-        "the bounded automatic restart should have brought a fresh worker up"
-    );
-
-    let recovered = daemon.recover("a").await.unwrap();
-    assert_eq!(recovered.state, "active");
+    wait_until_active(&daemon, "a").await;
+    wait_until_active(&daemon, "b").await;
 }
 
 /// A session left `Active`-but-sleeping (idle-supervisor path, not `Pausing`/
@@ -326,11 +314,10 @@ async fn concurrent_recovery_gets_busy_and_preserves_history() {
 }
 
 async fn wait_for_replacement(daemon: &Arc<Daemon<FakeEngine>>, session: &str, model: &str) {
+    let _ = session;
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
-            if daemon.inspect(session).unwrap().session.state != "active"
-                && daemon.workers.lock().await.contains_key(&wk(model))
-            {
+            if daemon.workers.lock().await.contains_key(&wk(model)) {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -338,4 +325,17 @@ async fn wait_for_replacement(daemon: &Arc<Daemon<FakeEngine>>, session: &str, m
     })
     .await
     .expect("worker loss and replacement must not deadlock");
+}
+
+async fn wait_until_active(daemon: &Arc<Daemon<FakeEngine>>, session: &str) {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if daemon.inspect(session).unwrap().session.state == "active" {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("automatic restart must reactivate the session");
 }

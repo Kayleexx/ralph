@@ -125,30 +125,30 @@ reuse cached KV blocks in VRAM.
 
 ## Demos
 
-### The strongest one: chat survives a crash and GPU pressure, hands-off
+### The main one: a single `ralph chat` survives a real crash
 
-Real run, real GPU, real vLLM — nothing here is scripted around lifecycle commands;
-`chat` and normal use are the only things typed.
+One `ralph chat` process stays open the whole time — the worker is killed from another
+terminal, and the very next message in that *same* chat transparently recovers it.
+Real run, real GPU, real vLLM:
 
 ```
 $ ralph run Qwen/Qwen2.5-0.5B-Instruct --name research
-✓ research ready · 22.6s
+research ready · 23.1s
 
 $ ralph chat research
-you › remember the word pineapple
-ralph › got it.
+you › Remember this word: marigold. Reply with just OK.
+ralph › OK
 
-# <worker killed externally — a crash, not a command>
+# <worker killed from another terminal — a crash, not a command>
 
-you › what word did i tell you to remember?
+you › What word did I ask you to remember?
 recovering research
-ready · 23.7s
-ralph › pineapple
+ready · 22.0s
+ralph › The word you asked me to remember is "marigold".
 ```
 
-Same conversation, same process, no `ralph recover` ever typed — the very next message
-after the crash transparently recovers the session first. Reopening `chat` later after
-the session's gone to sleep behaves the same way:
+No `ralph recover` typed, no reopening chat — the same process, the same conversation.
+Reopening `chat` later after the session's gone to sleep behaves the same way:
 
 ```
 $ ralph chat research
@@ -157,23 +157,24 @@ ready · 1.2s
 ralph › (conversation continues, context intact)
 ```
 
-And under real GPU pressure, starting a second model that doesn't fit makes room by
-sleeping the idle one instead of rejecting:
+### Pressure-aware admission (a second demo)
+
+Starting a second model that doesn't fit makes room by sleeping the idle one instead of
+rejecting — real run, a second process holding ~1 GiB to force genuine pressure on an
+8 GB GPU (two small Qwen models otherwise both fit without contention):
 
 ```
 $ ralph run Qwen/Qwen3-0.6B --name coding
 making room · sleeping research
-✓ coding ready · 1.8s
+coding ready · 26.0s
 ```
 
-Measured on a real run (RTX 5050 Laptop, 8151 MiB, a second process holding ~3 GiB to
-force genuine pressure): 1595 MiB free before, 1321 MiB after; `research` landed
-`hibernated`, never touched mid-query, and resumed later with its exact prior context
-intact. A **make-room decision that skips an idle-but-recent session** is covered
-separately by `make_room_prefers_ephemeral_over_durable_regardless_of_rebuild_cost` and
+`research` landed `hibernated`, never touched mid-query, and resumed later with its
+exact prior context intact. A **make-room decision that skips an idle-but-recent
+session** is covered separately by
+`make_room_prefers_ephemeral_over_durable_regardless_of_rebuild_cost` and
 `a_recently_active_session_is_never_demoted_to_make_room`
-(`src/daemon/tests_admission.rs`) — the policy/target logic this single real run doesn't
-exercise.
+(`src/daemon/tests_admission.rs`).
 
 ### Explicit control, for when you want it
 

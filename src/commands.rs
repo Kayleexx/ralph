@@ -243,8 +243,7 @@ pub async fn run_run(
                     println!("making room \u{b7} sleeping {demoted}");
                 }
                 println!(
-                    "{} {} ready \u{b7} {:.1}s",
-                    style(cli, "32", ok_mark(cli)),
+                    "{} ready \u{b7} {:.1}s",
                     style(cli, "1", &info.name),
                     elapsed.as_secs_f64()
                 );

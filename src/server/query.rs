@@ -26,31 +26,34 @@ pub(super) async fn ensure_ready<E: Engine + 'static>(
     .await
     .map_err(|e| CliError::Other(e.into()))?;
     let start = std::time::Instant::now();
-    // The crash supervisor (`recovery::handle_worker_loss`) may already be restarting
-    // this exact worker in the background — its first attempt starts ~200ms after the
-    // crash, and it and this call share one global start/attach lock (`try_lock`, fails
-    // fast rather than queuing, by design — see `attach_or_start_worker`). Losing that
-    // race isn't a real failure, just the two racing to do the same fix, so a few short
-    // retries checking whether the *other* side already finished beats surfacing "retry
-    // shortly" to a user who did nothing wrong.
-    let mut outcome = Ok(());
-    for attempt in 0..5 {
-        if attempt > 0 {
-            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+    let op = daemon.ready_up(&row.id, action, Some(cancel_rx));
+    tokio::pin!(op);
+    let mut outcome = tokio::select! {
+        result = &mut op => result,
+        _ = ipc::read_frame::<_, Cancel>(&mut reader) => {
+            let _ = cancel_tx.send(());
+            op.await
         }
-        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
-        let op = daemon.ready_up(&row.id, action, Some(cancel_rx));
-        tokio::pin!(op);
-        outcome = tokio::select! {
-            result = &mut op => result,
-            _ = ipc::read_frame::<_, Cancel>(&mut reader) => {
-                let _ = cancel_tx.send(());
-                op.await
+    };
+    // The crash supervisor may already be restarting this worker in the background —
+    // don't retry the lock ourselves (a third contender), just watch state settle.
+    if outcome.is_err() {
+        for _ in 0..100 {
+            let Ok((row, action)) = daemon.readiness_action(&row.id) else {
+                break;
+            };
+            if row.state == crate::state::SessionState::Active {
+                outcome = Ok(());
+                break;
             }
-        };
-        if outcome.is_ok() || matches!(daemon.readiness_action(&row.id), Ok((_, None))) {
-            outcome = Ok(());
-            break;
+            if action.is_none() {
+                break;
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_millis(300)) => {}
+                _ = ipc::read_frame::<_, Cancel>(&mut reader) => break,
+            }
         }
     }
     outcome?;
