@@ -15,7 +15,7 @@ use crate::storage::Storage;
 mod query;
 #[cfg(test)]
 mod tests;
-use query::handle_query;
+use query::{ensure_ready, handle_query};
 
 /// Runs the daemon in the foreground: acquires the single-instance lock, binds the
 /// socket, reconciles state left over from a previous run, then serves forever. If
@@ -208,6 +208,13 @@ async fn handle_connection<E: Engine + 'static>(
                 daemon.migrate_cancellable(&session, to, Some(cancel))
             })
             .await
+        }
+        ipc::Request::EnsureReady { session } => {
+            let result = ensure_ready(&daemon, &mut stream, &session)
+                .await
+                .and_then(|()| daemon.inspect(&session))
+                .map(|info| Response::Run(info.session));
+            send_result(&mut stream, result).await
         }
     }
 }

@@ -64,6 +64,13 @@ pub enum Request {
         session: String,
         to: u32,
     },
+    /// Sent only by `ralph chat` at startup: if the session isn't active yet
+    /// (crashed/asleep), recovers or restores it right away so the first prompt the
+    /// user types doesn't pay for that plus generation latency together. A no-op,
+    /// returning immediately, if the session is already active.
+    EnsureReady {
+        session: String,
+    },
 }
 
 /// Sent by the client in place of a new request while a `Query` is streaming, to cancel
@@ -195,7 +202,14 @@ pub struct DrainReport {
 #[derive(Debug, Serialize, Deserialize)]
 pub enum ServerMessage {
     Chunk(String),
-    Done { token_count: i64 },
+    /// A one-line, human-readable status update sent before generation starts —
+    /// currently only "recovering <name>"/"restoring <name>" followed by "ready ·
+    /// N.Ns" when a query transparently recovers or resumes a session first. Never
+    /// sent in `--json` mode's request path (the CLI suppresses it there).
+    Status(String),
+    Done {
+        token_count: i64,
+    },
     Result(Box<Response>),
 }
 

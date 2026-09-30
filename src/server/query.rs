@@ -3,12 +3,78 @@ use super::*;
 const FLUSH_TOKEN_BATCH: usize = 32;
 const FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
+/// If the session needs recovering or resuming before it can serve a query, does that
+/// now — streaming a `Status` frame before starting and another once it's ready — and
+/// otherwise returns immediately. Shared by `handle_query` (every query, so `ralph
+/// query`/`ralph chat` never need a manual `recover`/`resume` in between) and the
+/// `EnsureReady` request (`ralph chat`'s startup, so the first prompt a user types
+/// isn't also paying for recovery latency).
+pub(super) async fn ensure_ready<E: Engine + 'static>(
+    daemon: &Arc<Daemon<E>>,
+    stream: &mut UnixStream,
+    session: &str,
+) -> Result<(), CliError> {
+    let (row, action) = daemon.readiness_action(session)?;
+    let Some(action) = action else {
+        return Ok(());
+    };
+    let (mut reader, mut writer) = stream.split();
+    ipc::write_frame(
+        &mut writer,
+        &ServerMessage::Status(format!("{} {}", action.label(), row.name)),
+    )
+    .await
+    .map_err(|e| CliError::Other(e.into()))?;
+    let start = std::time::Instant::now();
+    // The crash supervisor (`recovery::handle_worker_loss`) may already be restarting
+    // this exact worker in the background — its first attempt starts ~200ms after the
+    // crash, and it and this call share one global start/attach lock (`try_lock`, fails
+    // fast rather than queuing, by design — see `attach_or_start_worker`). Losing that
+    // race isn't a real failure, just the two racing to do the same fix, so a few short
+    // retries checking whether the *other* side already finished beats surfacing "retry
+    // shortly" to a user who did nothing wrong.
+    let mut outcome = Ok(());
+    for attempt in 0..5 {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        }
+        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+        let op = daemon.ready_up(&row.id, action, Some(cancel_rx));
+        tokio::pin!(op);
+        outcome = tokio::select! {
+            result = &mut op => result,
+            _ = ipc::read_frame::<_, Cancel>(&mut reader) => {
+                let _ = cancel_tx.send(());
+                op.await
+            }
+        };
+        if outcome.is_ok() || matches!(daemon.readiness_action(&row.id), Ok((_, None))) {
+            outcome = Ok(());
+            break;
+        }
+    }
+    outcome?;
+    ipc::write_frame(
+        &mut writer,
+        &ServerMessage::Status(format!(
+            "ready \u{b7} {:.1}s",
+            start.elapsed().as_secs_f64()
+        )),
+    )
+    .await
+    .map_err(|e| CliError::Other(e.into()))?;
+    Ok(())
+}
+
 pub(super) async fn handle_query<E: Engine + 'static>(
     daemon: &Arc<Daemon<E>>,
     stream: &mut UnixStream,
     session: &str,
     prompt: &str,
 ) -> std::io::Result<()> {
+    if let Err(e) = ensure_ready(daemon, stream, session).await {
+        return send_result(stream, Err(e)).await;
+    }
     let running = match daemon.begin_query(session, prompt).await {
         Ok(r) => r,
         Err(e) => return send_result(stream, Err(e)).await,

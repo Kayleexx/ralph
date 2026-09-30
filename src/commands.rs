@@ -225,11 +225,13 @@ pub async fn run_run(
         continuity_target_ms,
     };
     let show_progress = !cli.json && !cli.quiet && std::io::stdout().is_terminal();
+    let start = Instant::now();
     let result = if show_progress {
         send_with_progress(&mut stream, &request, "starting").await
     } else {
         client::send_request(&mut stream, &request).await
     };
+    let elapsed = start.elapsed();
     match result {
         Ok(Response::Run(info)) => {
             if cli.json {
@@ -238,17 +240,20 @@ pub async fn run_run(
                 println!("{}", info.name);
             } else {
                 if let Some(demoted) = &info.made_room_for {
-                    println!("making room \u{2014} hibernated {demoted}");
+                    println!("making room \u{b7} sleeping {demoted}");
                 }
                 println!(
-                    "{} {} ready",
+                    "{} {} ready \u{b7} {:.1}s",
                     style(cli, "32", ok_mark(cli)),
-                    style(cli, "1", &info.name)
+                    style(cli, "1", &info.name),
+                    elapsed.as_secs_f64()
                 );
-                println!(
-                    "  model: {}",
-                    format_model_ref(&info.model, info.model_revision.as_deref())
-                );
+                if cli.verbose {
+                    println!(
+                        "  model: {}",
+                        format_model_ref(&info.model, info.model_revision.as_deref())
+                    );
+                }
             }
             0
         }

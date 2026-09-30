@@ -134,24 +134,19 @@ pub async fn run_resume(
                     style(cli, "32", ok_mark(cli)),
                     style(cli, "1", &info.session.name),
                 );
-            } else if info.native {
-                println!(
-                    "{} {} resumed from KV checkpoint in {:.1}s",
-                    style(cli, "32", ok_mark(cli)),
-                    style(cli, "1", &info.session.name),
-                    elapsed.as_secs_f64()
-                );
             } else {
                 println!(
-                    "KV checkpoint incompatible; rebuilding from {} tokens...",
-                    info.session.token_count
-                );
-                println!(
-                    "{} {} resumed in {:.1}s",
+                    "{} {} ready \u{b7} {:.1}s",
                     style(cli, "32", ok_mark(cli)),
                     style(cli, "1", &info.session.name),
                     elapsed.as_secs_f64()
                 );
+                if cli.verbose {
+                    println!(
+                        "  restore: {}",
+                        if info.native { "native" } else { "portable" }
+                    );
+                }
             }
             0
         }

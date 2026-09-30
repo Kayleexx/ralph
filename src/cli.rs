@@ -5,11 +5,22 @@ use clap::{CommandFactory, Parser, Subcommand};
 
 use crate::continuity::ContinuityPolicy;
 
+// Plain ASCII, not Unicode box-drawing — stays safe under `--no-color`'s "never emit
+// unicode glyphs" promise without needing to special-case this one banner.
+const BANNER: &str = r#"
+#####    ###    #      #####   #   #
+#   #   #   #   #      #   #   #   #
+#####   #####   #      #####   #####
+#  #    #   #   #      #       #   #
+#   #   #   #   #####   #      #   #
+"#;
+
 #[derive(Parser)]
 #[command(
     name = "ralph",
     version,
-    about = "A continuity runtime for stateful LLM inference."
+    about = "A continuity runtime for stateful LLM inference.",
+    before_help = BANNER
 )]
 pub struct Cli {
     /// Machine-readable output on stdout only; no human decoration, stable field names.

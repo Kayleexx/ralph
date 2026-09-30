@@ -22,7 +22,14 @@ pub async fn run_chat(home: &Path, cli: Flags, session: String) -> i32 {
     )
     .await
     {
-        Ok(Response::Inspect(info)) if info.session.state == "active" => {}
+        // Active, or a state `ensure_ready` below can transparently fix — anything
+        // else (moving/moved/failed/not found) can't be chatted with at all, so it's
+        // worth failing before the "chatting with..." banner rather than after.
+        Ok(Response::Inspect(info))
+            if matches!(
+                info.session.state.as_str(),
+                "active" | "recovering" | "paused" | "hibernated"
+            ) => {}
         Ok(Response::Inspect(info)) => {
             return print_error(
                 cli,
@@ -42,6 +49,21 @@ pub async fn run_chat(home: &Path, cli: Flags, session: String) -> i32 {
         Err(e) => return print_io_error(cli, e),
     }
 
+    // Transparently recover/restore before the first prompt, rather than paying for
+    // that plus the first turn's generation latency together with no feedback. A fresh
+    // connection: the daemon handles exactly one request per connection, and the one
+    // above already used its turn.
+    let mut ready_stream = match client::connect_or_start(home).await {
+        Ok(s) => s,
+        Err(e) => return print_io_error(cli, e),
+    };
+    match client::ensure_ready(&mut ready_stream, &session, false).await {
+        Ok(Response::Run(_)) => {}
+        Ok(Response::Error(payload)) => return print_error(cli, &payload),
+        Ok(_) => return print_protocol_error(cli),
+        Err(e) => return print_io_error(cli, e),
+    }
+
     let is_tty = std::io::stdout().is_terminal();
     if is_tty {
         println!(
@@ -56,7 +78,7 @@ pub async fn run_chat(home: &Path, cli: Flags, session: String) -> i32 {
 
     loop {
         if is_tty {
-            print!("{} ", style(cli, "1;36", "\u{203a}"));
+            print!("{} ", style(cli, "1;36", "you \u{203a}"));
             let _ = std::io::stdout().flush();
         }
         let Some(line) = read_line().await else {
@@ -77,7 +99,8 @@ pub async fn run_chat(home: &Path, cli: Flags, session: String) -> i32 {
                 continue;
             }
         };
-        match client::run_query(stream, &session, line, false).await {
+        let reply_prefix = Some(style(cli, "1;35", "ralph \u{203a} "));
+        match client::run_query(stream, &session, line, false, reply_prefix).await {
             // A blank line after the response, not just a newline, so turns read as
             // distinct blocks instead of running into the next prompt.
             Ok(client::QueryResult::Outcome(_)) => println!("\n"),

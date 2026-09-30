@@ -10,9 +10,10 @@ one worker process that happens to be running it right now.
 Running a local LLM directly through vLLM works fine until something goes wrong: a
 worker crashes mid-conversation, you need to restart the daemon, or a second model
 needs GPU memory another session is sitting on. Without Ralph, that's usually a lost
-conversation. With Ralph, recovery is a command (`ralph recover`), and admission under
-memory pressure is Ralph's own job (hibernate the cheapest idle session, not a manual
-`kill`) — not something you have to engineer around yourself.
+conversation. With Ralph, recovery happens on your next message — no command to
+remember — and admission under memory pressure is Ralph's own job (hibernate the
+cheapest idle session, not a manual `kill`) — not something you have to engineer around
+yourself.
 
 ## Install
 
@@ -29,15 +30,19 @@ to run on a totally fresh machine, it never creates or mutates anything.
 ```bash
 ralph doctor
 ralph run Qwen/Qwen2.5-0.5B-Instruct --name demo
-ralph query demo "Remember the word pineapple."
 ralph chat demo                                        # interactive; /exit or Ctrl-D
 ralph ps
 ```
 
-Crash survival, in one line: `kill -9` the worker process, then `ralph recover demo` —
-the conversation and its history are still there.
+Crash survival needs nothing extra — kill the worker mid-conversation
+(`kill -9 <worker pid>`, or just let vLLM die) and keep typing in the same `ralph chat`;
+Ralph recovers it before your next message goes through. `ralph query` (scriptable,
+one-shot) gets the same transparent recovery — see the demo below.
 
 ## What's here
+
+`chat`/`query` recover or resume a session automatically when needed — `recover`/
+`pause`/`resume`/`hibernate` below stay available for explicit, scripted control.
 
 - A Rust CLI (`ralph`) that talks to a local daemon over a Unix socket
 - SQLite WAL stores session metadata, accepted inputs, generated token IDs, and history
@@ -99,8 +104,10 @@ the current directory, then whatever `vllm` resolves to on `PATH` — never vend
 the repo.
 
 Ctrl-C during `query`/`chat` cancels that one generation without touching the session.
-Worker loss moves a session to `recovering`; automatic replacement has a bounded retry
-budget, and `ralph recover` retries explicitly and preserves session ID and history.
+Worker loss moves a session to `recovering`; the next `query`/`chat` message
+transparently recovers it first (`ralph recover` remains available for explicit,
+scripted control), and a background bounded-retry sweep also attempts replacement on
+its own.
 
 `checkpoint`/`pause`/`resume`/`hibernate` use vLLM 0.30.0's built-in `OffloadingConnector`
 + `TieringOffloadingSpec` filesystem tier as the native KV backend — confirmed by real
@@ -118,44 +125,66 @@ reuse cached KV blocks in VRAM.
 
 ## Demos
 
-### The strongest one: pressure-aware admission under real VRAM pressure
+### The strongest one: chat survives a crash and GPU pressure, hands-off
 
-Real run, real GPU (RTX 5050 Laptop, 8151 MiB), a second process holding ~3 GiB to
-force genuine pressure — not a mocked scenario:
+Real run, real GPU, real vLLM — nothing here is scripted around lifecycle commands;
+`chat` and normal use are the only things typed.
 
-```bash
-ralph run Qwen/Qwen2.5-0.5B-Instruct --name coding
-ralph query coding "Remember the secret word papaya. Reply with that word only."
-# ... coding sits idle long enough to be make-room-eligible ...
-ralph run Qwen/Qwen3-0.6B --name research
+```
+$ ralph run Qwen/Qwen2.5-0.5B-Instruct --name research
+✓ research ready · 22.6s
+
+$ ralph chat research
+you › remember the word pineapple
+ralph › got it.
+
+# <worker killed externally — a crash, not a command>
+
+you › what word did i tell you to remember?
+recovering research
+ready · 23.7s
+ralph › pineapple
 ```
 
-`coding` doesn't fit alongside `research` under the VRAM this run had free. Ralph
-hibernated the one idle, cheap-to-rebuild session instead of rejecting the new one:
+Same conversation, same process, no `ralph recover` ever typed — the very next message
+after the crash transparently recovers the session first. Reopening `chat` later after
+the session's gone to sleep behaves the same way:
 
-```json
-{"name":"research", ..., "made_room_for":"coding"}
+```
+$ ralph chat research
+restoring research
+ready · 1.2s
+ralph › (conversation continues, context intact)
 ```
 
-Measured on that run: 1595 MiB free before, 1321 MiB after (immediately; `research`'s
-own model weights account for the rest); `coding` correctly landed `hibernated`, never
-touched mid-query. Once VRAM was freed again (pausing `research`), resuming `coding`
-replayed its durable history (portable — this was `coding`'s first-ever worker, so no
-native checkpoint existed yet to restore from) and it answered "Papaya" — the exact
-word from before the eviction, context fully intact. A **make-room decision that skips
-an idle-but-recent session** is covered separately by
-`make_room_prefers_ephemeral_over_durable_regardless_of_rebuild_cost` and
+And under real GPU pressure, starting a second model that doesn't fit makes room by
+sleeping the idle one instead of rejecting:
+
+```
+$ ralph run Qwen/Qwen3-0.6B --name coding
+making room · sleeping research
+✓ coding ready · 1.8s
+```
+
+Measured on a real run (RTX 5050 Laptop, 8151 MiB, a second process holding ~3 GiB to
+force genuine pressure): 1595 MiB free before, 1321 MiB after; `research` landed
+`hibernated`, never touched mid-query, and resumed later with its exact prior context
+intact. A **make-room decision that skips an idle-but-recent session** is covered
+separately by `make_room_prefers_ephemeral_over_durable_regardless_of_rebuild_cost` and
 `a_recently_active_session_is_never_demoted_to_make_room`
-(`src/daemon/tests_admission.rs`) — the policy/target logic that isn't exercised by
-this single real run.
+(`src/daemon/tests_admission.rs`) — the policy/target logic this single real run doesn't
+exercise.
 
-### The rest, in short, on one session named `demo`:
+### Explicit control, for when you want it
 
-- **Crash survival**: `kill -9 <worker pid>` → `ralph recover demo` — history survives.
+The same things `chat`/`query` now do automatically are still available as their own
+commands, for scripting or manual control:
+
+- **Crash survival by hand**: `kill -9 <worker pid>` → `ralph recover demo`.
 - **Fast vs. portable resume**: `ralph checkpoint demo` → `ralph pause demo` →
-  `ralph resume demo` restores natively from the KV directory (`native: true`); a
-  missing/corrupt/incompatible checkpoint (including a vLLM upgrade) falls back to a
-  full replay instead (`native: false`) — context is correct either way.
+  `ralph resume demo` restores natively from the KV directory when possible, falls back
+  to a full replay otherwise — context is correct either way (`--verbose`/`--json` show
+  which path was taken).
 - **Hibernate/resume**: `ralph hibernate demo` → `ralph resume demo` — same round trip,
   tolerant of a failed checkpoint write.
 

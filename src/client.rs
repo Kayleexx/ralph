@@ -168,11 +168,17 @@ pub enum QueryResult {
 /// Streams a query's tokens, printing each one as it arrives unless `quiet` is set (JSON
 /// mode buffers separately and passes quiet=true here). The first Ctrl-C cancels the
 /// generation but leaves the session active; already-printed output is never rewound.
+///
+/// `reply_prefix`, if set, is printed once right before the first chunk — after any
+/// `Status` lines (transparent recovery/resume), never before them. `ralph chat` passes
+/// a pre-styled prompt like `"ralph \u{203a} "`; plain `ralph query` passes `None` and
+/// stays undecorated.
 pub async fn run_query(
     stream: UnixStream,
     session: &str,
     prompt: &str,
     quiet: bool,
+    mut reply_prefix: Option<String>,
 ) -> std::io::Result<QueryResult> {
     let (mut reader, mut writer) = stream.into_split();
     ipc::write_frame(
@@ -192,8 +198,16 @@ pub async fn run_query(
         tokio::select! {
             frame = ipc::read_frame::<_, ServerMessage>(&mut reader) => {
                 match frame? {
+                    Some(ServerMessage::Status(line)) => {
+                        if !quiet {
+                            println!("{line}");
+                        }
+                    }
                     Some(ServerMessage::Chunk(chunk)) => {
                         if !quiet {
+                            if let Some(prefix) = reply_prefix.take() {
+                                print!("{prefix}");
+                            }
                             print!("{chunk}");
                             let _ = std::io::stdout().flush();
                         }
@@ -219,4 +233,44 @@ pub async fn run_query(
         token_count,
         cancelled,
     }))
+}
+
+/// Drives `ralph chat`'s startup `EnsureReady` round trip: prints any `Status` lines as
+/// they arrive (unless `quiet`), then returns the final result. Cancellable the same
+/// way `run_query` is.
+pub async fn ensure_ready(
+    stream: &mut UnixStream,
+    session: &str,
+    quiet: bool,
+) -> std::io::Result<Response> {
+    let (mut reader, mut writer) = stream.split();
+    ipc::write_frame(
+        &mut writer,
+        &Request::EnsureReady {
+            session: session.to_string(),
+        },
+    )
+    .await?;
+    let mut ctrl_c = Box::pin(tokio::signal::ctrl_c());
+    let mut cancelled = false;
+    loop {
+        tokio::select! {
+            frame = ipc::read_frame::<_, ServerMessage>(&mut reader) => {
+                match frame? {
+                    Some(ServerMessage::Status(line)) => {
+                        if !quiet {
+                            println!("{line}");
+                        }
+                    }
+                    Some(ServerMessage::Result(boxed)) => return Ok(*boxed),
+                    _ => return Err(std::io::Error::other("daemon sent an unexpected message")),
+                }
+            }
+            _ = &mut ctrl_c, if !cancelled => {
+                cancelled = true;
+                ipc::write_frame(&mut writer, &Cancel).await?;
+                eprintln!("^C cancelled");
+            }
+        }
+    }
 }

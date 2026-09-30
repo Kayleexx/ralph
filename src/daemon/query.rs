@@ -1,6 +1,61 @@
 use super::*;
 
+/// What a session needs before it can serve a query, if anything — the one decision
+/// point auto-recovery (`chat`/`query`) and explicit `ralph recover`/`ralph resume`
+/// both resolve the same way, so a crashed or sleeping session never has two different
+/// fixes depending on how it's reached.
+#[derive(Clone, Copy)]
+pub(crate) enum ReadinessAction {
+    Recover,
+    Restore,
+}
+
+impl ReadinessAction {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            ReadinessAction::Recover => "recovering",
+            ReadinessAction::Restore => "restoring",
+        }
+    }
+}
+
 impl<E: Engine + 'static> Daemon<E> {
+    /// Resolves `identifier` and classifies what it needs, if anything, with no side
+    /// effects — `None` means already active or in a state auto-recovery has no
+    /// business touching (e.g. `Moving`), in which case the caller's own state check
+    /// on the returned row produces the precise error.
+    pub(crate) fn readiness_action(
+        &self,
+        identifier: &str,
+    ) -> Result<(SessionRow, Option<ReadinessAction>), CliError> {
+        let row = self.storage().resolve(identifier)?;
+        let action = match row.state {
+            SessionState::Recovering => Some(ReadinessAction::Recover),
+            SessionState::Paused | SessionState::Hibernated => Some(ReadinessAction::Restore),
+            _ => None,
+        };
+        Ok((row, action))
+    }
+
+    /// Performs the action `readiness_action` chose, reusing the exact same recovery/
+    /// resume machinery `ralph recover`/`ralph resume` use — no separate mechanism.
+    pub(crate) async fn ready_up(
+        self: &Arc<Self>,
+        identifier: &str,
+        action: ReadinessAction,
+        cancel: Option<tokio::sync::oneshot::Receiver<()>>,
+    ) -> Result<(), CliError> {
+        match action {
+            ReadinessAction::Recover => {
+                self.recover_cancellable(identifier, cancel).await.map(drop)
+            }
+            ReadinessAction::Restore => self
+                .resume_cancellable(identifier, super::lifecycle::ResumeMode::Auto, cancel)
+                .await
+                .map(drop),
+        }
+    }
+
     /// Resolves a session for querying and reserves it for exclusive use for the
     /// duration of the request; a second concurrent query on the *same session* fails
     /// fast rather than queuing (sessions sharing a worker can still run concurrently —

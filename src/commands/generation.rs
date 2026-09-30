@@ -20,7 +20,7 @@ pub async fn run_query(
         Ok(s) => s,
         Err(code) => return code,
     };
-    match client::run_query(stream, &session, &prompt, cli.json).await {
+    match client::run_query(stream, &session, &prompt, cli.json, None).await {
         Ok(client::QueryResult::Outcome(outcome)) => {
             if cli.json {
                 print_json(
@@ -57,7 +57,7 @@ pub async fn run_recover(home: &Path, cli: Flags, session: String) -> i32 {
                 println!("{}", info.name);
             } else {
                 println!(
-                    "{} {} recovered in {:.1}s",
+                    "{} {} ready \u{b7} {:.1}s",
                     style(cli, "32", ok_mark(cli)),
                     style(cli, "1", &info.name),
                     elapsed.as_secs_f64()
